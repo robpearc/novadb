@@ -989,9 +989,11 @@ class FeatureEngineeringPipeline:
         msa_deletions: Optional[Sequence[Sequence[int]]] = None,
         template_coords: Optional[np.ndarray] = None,
         template_mask: Optional[np.ndarray] = None,
+        resolution: Optional[float] = None,
+        is_distillation: bool = False,
     ) -> Dict[str, np.ndarray]:
         """Extract all AF3 Table 5 features.
-        
+
         Args:
             residue_names: Residue name for each token.
             chain_ids: Chain ID for each token.
@@ -1003,13 +1005,15 @@ class FeatureEngineeringPipeline:
             msa_deletions: Optional MSA deletion counts.
             template_coords: Optional template backbone coords.
             template_mask: Optional template validity mask.
-            
+            resolution: Optional experimental resolution in Angstroms.
+            is_distillation: Whether data comes from distillation.
+
         Returns:
             Dictionary of all extracted features.
         """
         features = {}
         num_tokens = len(residue_names)
-        
+
         # Reference conformer features
         ref_features = self.ref_conformer_extractor.extract(
             residue_names,
@@ -1024,7 +1028,44 @@ class FeatureEngineeringPipeline:
         features["ref_atom_name_chars"] = ref_features.ref_atom_name_chars
         features["ref_space_uid"] = ref_features.ref_space_uid
         features["atom_to_token"] = ref_features.atom_to_token
-        
+
+        # Extract atom existence and ambiguity features
+        atom_exists_features = self._extract_atom_exists_features(
+            residue_names, atom_coords, atom_names
+        )
+        features["atom_exists"] = atom_exists_features["atom_exists"]
+        features["atom_is_ambiguous"] = atom_exists_features["atom_is_ambiguous"]
+
+        # Extract frame atom mask
+        features["frame_atom_mask"] = self._extract_frame_atom_mask(
+            residue_names, atom_names
+        )
+
+        # Extract target features (one-hot residue types)
+        features["target_feat"] = self._extract_target_feat(residue_names)
+
+        # Extract pseudo-beta features
+        pseudo_beta_features = self._extract_pseudo_beta_features(
+            residue_names, atom_coords, atom_names
+        )
+        features["pseudo_beta"] = pseudo_beta_features["pseudo_beta"]
+        features["pseudo_beta_mask"] = pseudo_beta_features["pseudo_beta_mask"]
+
+        # Extract backbone rigid features
+        rigid_features = self._extract_backbone_rigid_features(
+            residue_names, atom_coords, atom_names
+        )
+        features["backbone_rigid_tensor"] = rigid_features["backbone_rigid_tensor"]
+        features["backbone_rigid_mask"] = rigid_features["backbone_rigid_mask"]
+
+        # Extract pair features
+        pair_features = self._extract_pair_features(
+            chain_ids, residue_indices, num_tokens
+        )
+        features["relative_position"] = pair_features["relative_position"]
+        features["same_chain"] = pair_features["same_chain"]
+        features["same_entity"] = pair_features["same_entity"]
+
         # MSA profile features
         if msa_sequences is not None:
             msa_features = self.msa_profile_extractor.extract_from_sequences(
@@ -1035,7 +1076,7 @@ class FeatureEngineeringPipeline:
             features["deletion_mean"] = msa_features.deletion_mean
             features["has_deletion"] = msa_features.has_deletion
             features["deletion_value"] = msa_features.deletion_value
-        
+
         # Template frame features
         if template_coords is not None and template_mask is not None:
             template_features = self.template_frame_extractor.extract(
@@ -1048,7 +1089,7 @@ class FeatureEngineeringPipeline:
             features["template_distogram"] = template_features.template_distogram
             if template_features.template_unit_vector is not None:
                 features["template_unit_vector"] = template_features.template_unit_vector
-        
+
         # Bond features
         bond_features = self.bond_extractor.extract(
             chain_ids,
@@ -1061,8 +1102,318 @@ class FeatureEngineeringPipeline:
             features["bond_types"] = bond_features.bond_types
         if bond_features.polymer_ligand_bonds is not None:
             features["polymer_ligand_bonds"] = bond_features.polymer_ligand_bonds
-        
+
+        # Metadata features
+        if resolution is not None:
+            features["resolution"] = np.array([resolution], dtype=np.float32)
+        features["is_distillation"] = np.array([is_distillation], dtype=np.bool_)
+
         return features
+
+    def _extract_atom_exists_features(
+        self,
+        residue_names: Sequence[str],
+        atom_coords: Sequence[np.ndarray],
+        atom_names: Sequence[Sequence[str]],
+    ) -> Dict[str, np.ndarray]:
+        """Extract atom existence and ambiguity features."""
+        total_atoms = sum(len(coords) for coords in atom_coords)
+
+        atom_exists = np.zeros(total_atoms, dtype=np.float32)
+        atom_is_ambiguous = np.zeros(total_atoms, dtype=np.float32)
+
+        # Ambiguous atom sets for symmetric sidechains
+        AMBIGUOUS_ATOMS = {
+            "ARG": {"NH1", "NH2"},
+            "ASP": {"OD1", "OD2"},
+            "GLU": {"OE1", "OE2"},
+            "LEU": {"CD1", "CD2"},
+            "PHE": {"CD1", "CD2", "CE1", "CE2"},
+            "TYR": {"CD1", "CD2", "CE1", "CE2"},
+            "VAL": {"CG1", "CG2"},
+        }
+
+        atom_idx = 0
+        for token_idx, coords in enumerate(atom_coords):
+            res_name = residue_names[token_idx]
+            names = atom_names[token_idx] if token_idx < len(atom_names) else []
+            ambiguous_set = AMBIGUOUS_ATOMS.get(res_name, set())
+
+            for i, coord in enumerate(coords):
+                if not np.any(np.isnan(coord)):
+                    atom_exists[atom_idx] = 1.0
+
+                if i < len(names) and names[i] in ambiguous_set:
+                    atom_is_ambiguous[atom_idx] = 1.0
+
+                atom_idx += 1
+
+        return {
+            "atom_exists": atom_exists,
+            "atom_is_ambiguous": atom_is_ambiguous,
+        }
+
+    def _extract_frame_atom_mask(
+        self,
+        residue_names: Sequence[str],
+        atom_names: Sequence[Sequence[str]],
+    ) -> np.ndarray:
+        """Extract frame atom mask."""
+        total_atoms = sum(len(names) for names in atom_names)
+        frame_atom_mask = np.zeros(total_atoms, dtype=np.float32)
+
+        PROTEIN_FRAME_ATOMS = {"N", "CA", "C"}
+        NUCLEIC_FRAME_ATOMS = {"C1'", "C3'", "C4'"}
+        PROTEIN_RESIDUES = {
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+            "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+        }
+        NUCLEIC_RESIDUES = {"A", "G", "C", "U", "DA", "DG", "DC", "DT"}
+
+        atom_idx = 0
+        for token_idx, names in enumerate(atom_names):
+            res_name = residue_names[token_idx] if token_idx < len(residue_names) else ""
+
+            if res_name in PROTEIN_RESIDUES:
+                frame_atoms = PROTEIN_FRAME_ATOMS
+            elif res_name in NUCLEIC_RESIDUES:
+                frame_atoms = NUCLEIC_FRAME_ATOMS
+            else:
+                frame_atoms = set(list(names)[:3]) if names else set()
+
+            for name in names:
+                if name in frame_atoms:
+                    frame_atom_mask[atom_idx] = 1.0
+                atom_idx += 1
+
+        return frame_atom_mask
+
+    def _extract_target_feat(
+        self,
+        residue_names: Sequence[str],
+    ) -> np.ndarray:
+        """Extract target features (one-hot residue types)."""
+        n_tokens = len(residue_names)
+        target_feat = np.zeros((n_tokens, NUM_RESIDUE_TYPES), dtype=np.float32)
+
+        AA_MAP = {
+            "ALA": 0, "ARG": 1, "ASN": 2, "ASP": 3, "CYS": 4,
+            "GLN": 5, "GLU": 6, "GLY": 7, "HIS": 8, "ILE": 9,
+            "LEU": 10, "LYS": 11, "MET": 12, "PHE": 13, "PRO": 14,
+            "SER": 15, "THR": 16, "TRP": 17, "TYR": 18, "VAL": 19,
+        }
+        AA_UNK_IDX = 20
+        RNA_MAP = {"A": 21, "G": 22, "C": 23, "U": 24}
+        RNA_UNK_IDX = 25
+        DNA_MAP = {"DA": 26, "DG": 27, "DC": 28, "DT": 29}
+        DNA_UNK_IDX = 30
+
+        for i, res_name in enumerate(residue_names):
+            if res_name in AA_MAP:
+                idx = AA_MAP[res_name]
+            elif res_name in RNA_MAP:
+                idx = RNA_MAP[res_name]
+            elif res_name in DNA_MAP:
+                idx = DNA_MAP[res_name]
+            else:
+                idx = AA_UNK_IDX
+            target_feat[i, idx] = 1.0
+
+        return target_feat
+
+    def _extract_pseudo_beta_features(
+        self,
+        residue_names: Sequence[str],
+        atom_coords: Sequence[np.ndarray],
+        atom_names: Sequence[Sequence[str]],
+    ) -> Dict[str, np.ndarray]:
+        """Extract pseudo-beta features (CB or CA for GLY)."""
+        n_tokens = len(residue_names)
+        pseudo_beta = np.zeros((n_tokens, 3), dtype=np.float32)
+        pseudo_beta_mask = np.zeros(n_tokens, dtype=np.float32)
+
+        for i, (res_name, coords, names) in enumerate(
+            zip(residue_names, atom_coords, atom_names)
+        ):
+            names_list = list(names) if names else []
+            coords_arr = np.array(coords) if len(coords) > 0 else np.zeros((0, 3))
+
+            # Find CB or CA
+            cb_idx = None
+            ca_idx = None
+            for j, name in enumerate(names_list):
+                if name == "CB":
+                    cb_idx = j
+                elif name == "CA":
+                    ca_idx = j
+
+            # Use CB for non-GLY, CA for GLY
+            if res_name == "GLY":
+                target_idx = ca_idx
+            else:
+                target_idx = cb_idx if cb_idx is not None else ca_idx
+
+            if target_idx is not None and target_idx < len(coords_arr):
+                pseudo_beta[i] = coords_arr[target_idx]
+                pseudo_beta_mask[i] = 1.0
+
+        return {
+            "pseudo_beta": pseudo_beta,
+            "pseudo_beta_mask": pseudo_beta_mask,
+        }
+
+    def _extract_backbone_rigid_features(
+        self,
+        residue_names: Sequence[str],
+        atom_coords: Sequence[np.ndarray],
+        atom_names: Sequence[Sequence[str]],
+    ) -> Dict[str, np.ndarray]:
+        """Extract backbone rigid body representation."""
+        n_tokens = len(residue_names)
+        backbone_rigid_tensor = np.zeros((n_tokens, 4, 4), dtype=np.float32)
+        backbone_rigid_mask = np.zeros(n_tokens, dtype=np.float32)
+
+        PROTEIN_RESIDUES = {
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+            "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+        }
+        NUCLEIC_RESIDUES = {"A", "G", "C", "U", "DA", "DG", "DC", "DT"}
+
+        for i, (res_name, coords, names) in enumerate(
+            zip(residue_names, atom_coords, atom_names)
+        ):
+            names_list = list(names) if names else []
+            coords_arr = np.array(coords) if len(coords) > 0 else np.zeros((0, 3))
+
+            frame = None
+
+            if res_name in PROTEIN_RESIDUES:
+                # Find N, CA, C atoms
+                n_idx = ca_idx = c_idx = None
+                for j, name in enumerate(names_list):
+                    if name == "N":
+                        n_idx = j
+                    elif name == "CA":
+                        ca_idx = j
+                    elif name == "C":
+                        c_idx = j
+
+                if all(idx is not None and idx < len(coords_arr)
+                       for idx in [n_idx, ca_idx, c_idx]):
+                    frame = self._compute_frame(
+                        coords_arr[n_idx],
+                        coords_arr[ca_idx],
+                        coords_arr[c_idx],
+                    )
+
+            elif res_name in NUCLEIC_RESIDUES:
+                # Find C1', C3', C4' atoms
+                c1_idx = c3_idx = c4_idx = None
+                for j, name in enumerate(names_list):
+                    if name == "C1'":
+                        c1_idx = j
+                    elif name == "C3'":
+                        c3_idx = j
+                    elif name == "C4'":
+                        c4_idx = j
+
+                if all(idx is not None and idx < len(coords_arr)
+                       for idx in [c1_idx, c3_idx, c4_idx]):
+                    frame = self._compute_frame(
+                        coords_arr[c3_idx],
+                        coords_arr[c4_idx],
+                        coords_arr[c1_idx],
+                    )
+
+            else:
+                # For ligands, use first 3 atoms if available
+                if len(coords_arr) >= 3:
+                    frame = self._compute_frame(
+                        coords_arr[0],
+                        coords_arr[1],
+                        coords_arr[2],
+                    )
+
+            if frame is not None:
+                backbone_rigid_tensor[i] = frame
+                backbone_rigid_mask[i] = 1.0
+            else:
+                backbone_rigid_tensor[i] = np.eye(4, dtype=np.float32)
+
+        return {
+            "backbone_rigid_tensor": backbone_rigid_tensor,
+            "backbone_rigid_mask": backbone_rigid_mask,
+        }
+
+    def _compute_frame(
+        self,
+        n_pos: np.ndarray,
+        ca_pos: np.ndarray,
+        c_pos: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Compute 4x4 transformation matrix from three atoms."""
+        if np.any(np.isnan(n_pos)) or np.any(np.isnan(ca_pos)) or np.any(np.isnan(c_pos)):
+            return None
+
+        # X-axis: CA -> C direction
+        x_axis = c_pos - ca_pos
+        x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-6:
+            return None
+        x_axis = x_axis / x_norm
+
+        # Y-axis: perpendicular in N-CA-C plane
+        n_to_ca = ca_pos - n_pos
+        y_axis = n_to_ca - np.dot(n_to_ca, x_axis) * x_axis
+        y_norm = np.linalg.norm(y_axis)
+        if y_norm < 1e-6:
+            return None
+        y_axis = y_axis / y_norm
+
+        # Z-axis: cross product
+        z_axis = np.cross(x_axis, y_axis)
+
+        # Build 4x4 matrix
+        frame = np.eye(4, dtype=np.float32)
+        frame[:3, 0] = x_axis
+        frame[:3, 1] = y_axis
+        frame[:3, 2] = z_axis
+        frame[:3, 3] = ca_pos
+
+        return frame
+
+    def _extract_pair_features(
+        self,
+        chain_ids: Sequence[str],
+        residue_indices: Sequence[int],
+        num_tokens: int,
+        max_relative_idx: int = 32,
+    ) -> Dict[str, np.ndarray]:
+        """Extract pairwise token features."""
+        relative_position = np.zeros((num_tokens, num_tokens), dtype=np.int32)
+        same_chain = np.zeros((num_tokens, num_tokens), dtype=np.float32)
+        same_entity = np.zeros((num_tokens, num_tokens), dtype=np.float32)
+
+        for i in range(num_tokens):
+            for j in range(num_tokens):
+                if chain_ids[i] == chain_ids[j]:
+                    same_chain[i, j] = 1.0
+                    diff = residue_indices[j] - residue_indices[i]
+                    diff = max(-max_relative_idx, min(max_relative_idx, diff))
+                    relative_position[i, j] = diff + max_relative_idx
+                else:
+                    relative_position[i, j] = 2 * max_relative_idx + 1
+
+                # same_entity would need entity_id mapping
+                # For now, assume same chain = same entity
+                if chain_ids[i] == chain_ids[j]:
+                    same_entity[i, j] = 1.0
+
+        return {
+            "relative_position": relative_position,
+            "same_chain": same_chain,
+            "same_entity": same_entity,
+        }
 
 
 def create_feature_pipeline(

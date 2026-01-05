@@ -28,7 +28,7 @@ from novadb.search.msa.msa import MSA
 @dataclass
 class InputFeatures:
     """Container for all input features.
-    
+
     From AF3 Table 5, organized by feature type.
     """
     # Token-level features (Ntokens,)
@@ -54,11 +54,34 @@ class InputFeatures:
     # Token-to-atom mapping (for aggregation)
     atom_to_token: np.ndarray  # int32 (Natoms,)
 
+    # Atom existence and ambiguity features (Natoms,) - Training targets
+    atom_exists: Optional[np.ndarray] = None  # float32, mask for atoms to predict
+    atom_is_ambiguous: Optional[np.ndarray] = None  # float32, symmetric/ambiguous atoms
+
+    # Frame atom mask (Natoms,) - Atoms defining local coordinate frames
+    frame_atom_mask: Optional[np.ndarray] = None  # float32, atoms used in frame construction
+
+    # Target features for training (Ntokens,)
+    target_feat: Optional[np.ndarray] = None  # int32, one-hot target residue type
+
+    # Query structure pseudo-beta positions (Ntokens, 3)
+    pseudo_beta: Optional[np.ndarray] = None  # float32, CB (or CA for GLY) positions
+    pseudo_beta_mask: Optional[np.ndarray] = None  # float32, validity mask
+
+    # Backbone rigid body representation (Ntokens,)
+    backbone_rigid_tensor: Optional[np.ndarray] = None  # float32 (Ntokens, 4, 4)
+    backbone_rigid_mask: Optional[np.ndarray] = None  # float32 (Ntokens,)
+
     # MSA features (Nmsa, Ntokens)
     msa: Optional[np.ndarray] = None  # int32, values 0-32
     msa_mask: Optional[np.ndarray] = None  # float32
     msa_deletion_value: Optional[np.ndarray] = None  # float32
     msa_species: Optional[np.ndarray] = None  # int32 per-sequence
+
+    # MSA profile features (Ntokens,)
+    msa_profile: Optional[np.ndarray] = None  # float32 (Ntokens, 32)
+    deletion_mean: Optional[np.ndarray] = None  # float32 (Ntokens,)
+    has_deletion: Optional[np.ndarray] = None  # float32 (Ntokens,)
 
     # Template features (Ntemplates, Ntokens)
     template_restype: Optional[np.ndarray] = None  # int32
@@ -66,13 +89,23 @@ class InputFeatures:
     template_pseudo_beta_mask: Optional[np.ndarray] = None  # float32
     template_backbone_mask: Optional[np.ndarray] = None  # float32
     template_distogram: Optional[np.ndarray] = None  # float32 (Nt, Ntok, Ntok, 39)
+    template_backbone_frame: Optional[np.ndarray] = None  # float32 (Nt, Ntok, 4, 4)
+    template_backbone_frame_mask: Optional[np.ndarray] = None  # float32 (Nt, Ntok)
+    template_unit_vector: Optional[np.ndarray] = None  # float32 (Nt, Ntok, Ntok, 3)
 
     # Pair features (Ntokens, Ntokens)
     token_bonds: Optional[np.ndarray] = None  # int32 sparse bond matrix
+    relative_position: Optional[np.ndarray] = None  # int32 (Ntokens, Ntokens)
+    same_chain: Optional[np.ndarray] = None  # float32 (Ntokens, Ntokens)
+    same_entity: Optional[np.ndarray] = None  # float32 (Ntokens, Ntokens)
 
     # Ground truth for training (Natoms, 3)
     atom_gt_coords: Optional[np.ndarray] = None  # float32
     atom_gt_mask: Optional[np.ndarray] = None  # float32
+
+    # Metadata features
+    resolution: Optional[float] = None  # Experimental resolution in Angstroms
+    is_distillation: bool = False  # Whether data comes from distillation
 
     # Metadata
     num_tokens: int = 0
@@ -162,14 +195,18 @@ class FeatureExtractor:
         tokenized: TokenizedStructure,
         msa: Optional[MSA] = None,
         templates: Optional[List[TokenizedStructure]] = None,
+        resolution: Optional[float] = None,
+        is_distillation: bool = False,
     ) -> InputFeatures:
         """Extract all input features.
-        
+
         Args:
             tokenized: Tokenized structure
             msa: Optional MSA for the structure
             templates: Optional list of template structures
-            
+            resolution: Optional experimental resolution in Angstroms
+            is_distillation: Whether data comes from distillation
+
         Returns:
             InputFeatures with all extracted features
         """
@@ -182,10 +219,35 @@ class FeatureExtractor:
         # Extract atom-level features
         atom_features = self._extract_atom_features(tokens)
 
+        # Extract atom existence and ambiguity features
+        atom_exists_features = self._extract_atom_exists_features(tokens)
+
+        # Extract frame atom mask
+        frame_features = self._extract_frame_atom_mask(tokens)
+
+        # Extract target features
+        target_features = self._extract_target_features(tokens)
+
+        # Extract pseudo-beta features
+        pseudo_beta_features = self._extract_pseudo_beta_features(tokens)
+
+        # Extract backbone rigid features
+        rigid_features = self._extract_backbone_rigid_features(tokens)
+
+        # Extract pair features
+        pair_features = self._extract_pair_features(tokens)
+
         # Extract MSA features if provided
         msa_features = {}
+        msa_profile_features = {}
         if msa is not None:
             msa_features = self._extract_msa_features(msa, tokens)
+            # Extract MSA profile features
+            if msa_features.get("msa") is not None:
+                msa_profile_features = self._extract_msa_profile_features(
+                    msa_features["msa"],
+                    msa_features.get("msa_deletion_value", np.zeros((1, n_tokens))),
+                )
 
         # Extract template features if provided
         template_features = {}
@@ -214,11 +276,28 @@ class FeatureExtractor:
             atom_ref_atom_name_chars=atom_features["atom_ref_atom_name_chars"],
             atom_ref_space_uid=atom_features["atom_ref_space_uid"],
             atom_to_token=atom_features["atom_to_token"],
+            # Atom existence and ambiguity features
+            atom_exists=atom_exists_features["atom_exists"],
+            atom_is_ambiguous=atom_exists_features["atom_is_ambiguous"],
+            # Frame atom mask
+            frame_atom_mask=frame_features["frame_atom_mask"],
+            # Target features
+            target_feat=target_features["target_feat"],
+            # Pseudo-beta features
+            pseudo_beta=pseudo_beta_features["pseudo_beta"],
+            pseudo_beta_mask=pseudo_beta_features["pseudo_beta_mask"],
+            # Backbone rigid features
+            backbone_rigid_tensor=rigid_features["backbone_rigid_tensor"],
+            backbone_rigid_mask=rigid_features["backbone_rigid_mask"],
             # MSA features
             msa=msa_features.get("msa"),
             msa_mask=msa_features.get("msa_mask"),
             msa_deletion_value=msa_features.get("msa_deletion_value"),
             msa_species=msa_features.get("msa_species"),
+            # MSA profile features
+            msa_profile=msa_profile_features.get("msa_profile"),
+            deletion_mean=msa_profile_features.get("deletion_mean"),
+            has_deletion=msa_profile_features.get("has_deletion"),
             # Template features
             template_restype=template_features.get("template_restype"),
             template_pseudo_beta=template_features.get("template_pseudo_beta"),
@@ -227,6 +306,19 @@ class FeatureExtractor:
             ),
             template_backbone_mask=template_features.get("template_backbone_mask"),
             template_distogram=template_features.get("template_distogram"),
+            template_backbone_frame=template_features.get("template_backbone_frame"),
+            template_backbone_frame_mask=template_features.get(
+                "template_backbone_frame_mask"
+            ),
+            template_unit_vector=template_features.get("template_unit_vector"),
+            # Pair features
+            token_bonds=pair_features.get("token_bonds"),
+            relative_position=pair_features.get("relative_position"),
+            same_chain=pair_features.get("same_chain"),
+            same_entity=pair_features.get("same_entity"),
+            # Metadata features
+            resolution=resolution,
+            is_distillation=is_distillation,
             # Metadata
             num_tokens=n_tokens,
             num_atoms=atom_features["num_atoms"],
@@ -471,6 +563,17 @@ class FeatureExtractor:
         template_distogram = np.zeros(
             (n_templates, n_tokens, n_tokens, 39), dtype=np.float32
         )
+        # Backbone frames: 4x4 transformation matrices
+        template_backbone_frame = np.zeros(
+            (n_templates, n_tokens, 4, 4), dtype=np.float32
+        )
+        template_backbone_frame_mask = np.zeros(
+            (n_templates, n_tokens), dtype=np.float32
+        )
+        # Unit vectors between residue pairs
+        template_unit_vector = np.zeros(
+            (n_templates, n_tokens, n_tokens, 3), dtype=np.float32
+        )
 
         for t_idx, template in enumerate(templates[:n_templates]):
             # Build mapping from query to template positions
@@ -495,20 +598,38 @@ class FeatureExtractor:
                 if self._has_backbone(token):
                     template_backbone_mask[t_idx, q_idx] = 1.0
 
-            # Compute distogram
+                # Compute backbone frame
+                frame = self._compute_backbone_frame(token)
+                if frame is not None:
+                    template_backbone_frame[t_idx, q_idx] = frame
+                    template_backbone_frame_mask[t_idx, q_idx] = 1.0
+                else:
+                    # Identity matrix as default
+                    template_backbone_frame[t_idx, q_idx] = np.eye(4, dtype=np.float32)
+
+            # Compute distogram and unit vectors
             for i in range(n_tokens):
                 for j in range(i + 1, n_tokens):
                     if (
                         template_pseudo_beta_mask[t_idx, i] > 0
                         and template_pseudo_beta_mask[t_idx, j] > 0
                     ):
-                        dist = np.linalg.norm(
-                            template_pseudo_beta[t_idx, i]
-                            - template_pseudo_beta[t_idx, j]
+                        diff = (
+                            template_pseudo_beta[t_idx, j]
+                            - template_pseudo_beta[t_idx, i]
                         )
+                        dist = np.linalg.norm(diff)
+
+                        # Distogram bin
                         bin_idx = self._distance_to_bin(dist)
                         template_distogram[t_idx, i, j, bin_idx] = 1.0
                         template_distogram[t_idx, j, i, bin_idx] = 1.0
+
+                        # Unit vector (direction from i to j)
+                        if dist > 1e-8:
+                            unit_vec = diff / dist
+                            template_unit_vector[t_idx, i, j] = unit_vec
+                            template_unit_vector[t_idx, j, i] = -unit_vec
 
         return {
             "template_restype": template_restype,
@@ -516,6 +637,9 @@ class FeatureExtractor:
             "template_pseudo_beta_mask": template_pseudo_beta_mask,
             "template_backbone_mask": template_backbone_mask,
             "template_distogram": template_distogram,
+            "template_backbone_frame": template_backbone_frame,
+            "template_backbone_frame_mask": template_backbone_frame_mask,
+            "template_unit_vector": template_unit_vector,
         }
 
     def _find_matching_token(
@@ -554,7 +678,7 @@ class FeatureExtractor:
 
     def _distance_to_bin(self, distance: float, num_bins: int = 39) -> int:
         """Convert distance to distogram bin index.
-        
+
         From AF3: 39 bins, 3.25 to 50.75 Å, 1.25 Å spacing
         """
         min_dist = 3.25
@@ -567,6 +691,286 @@ class FeatureExtractor:
             return num_bins - 1
 
         return int((distance - min_dist) / bin_width)
+
+    def _extract_atom_exists_features(
+        self, tokens: List[Token]
+    ) -> Dict[str, np.ndarray]:
+        """Extract atom existence and ambiguity features.
+
+        From AF3 Table 5:
+        - atom_exists: Mask indicating which atoms should be predicted
+        - atom_is_ambiguous: Mask for symmetric/ambiguous atom positions
+
+        For training, atom_exists indicates ground truth atom positions.
+        For ambiguous atoms (e.g., symmetric sidechains), special handling
+        is needed for loss computation.
+        """
+        total_atoms = sum(token.num_atoms for token in tokens)
+
+        atom_exists = np.zeros(total_atoms, dtype=np.float32)
+        atom_is_ambiguous = np.zeros(total_atoms, dtype=np.float32)
+
+        # Ambiguous atom sets for symmetric sidechains
+        # From AF3: these atoms can be swapped without changing the structure
+        AMBIGUOUS_ATOMS = {
+            "ARG": {"NH1", "NH2"},  # Guanidinium
+            "ASP": {"OD1", "OD2"},  # Carboxylate
+            "GLU": {"OE1", "OE2"},  # Carboxylate
+            "LEU": {"CD1", "CD2"},  # Isopropyl
+            "PHE": {"CD1", "CD2", "CE1", "CE2"},  # Phenyl ring
+            "TYR": {"CD1", "CD2", "CE1", "CE2"},  # Phenyl ring
+            "VAL": {"CG1", "CG2"},  # Isopropyl
+        }
+
+        atom_idx = 0
+        for token in tokens:
+            ambiguous_set = AMBIGUOUS_ATOMS.get(token.residue_name, set())
+
+            for atom_name, atom in token.atoms.items():
+                # Atom exists if it has valid coordinates
+                if not np.any(np.isnan(atom.coords)):
+                    atom_exists[atom_idx] = 1.0
+
+                # Mark ambiguous atoms
+                if atom_name in ambiguous_set:
+                    atom_is_ambiguous[atom_idx] = 1.0
+
+                atom_idx += 1
+
+        return {
+            "atom_exists": atom_exists,
+            "atom_is_ambiguous": atom_is_ambiguous,
+        }
+
+    def _extract_frame_atom_mask(
+        self, tokens: List[Token]
+    ) -> Dict[str, np.ndarray]:
+        """Extract frame atom mask.
+
+        From AF3: Indicates which atoms are used to construct
+        local coordinate frames for each residue.
+
+        For proteins: N, CA, C atoms define the backbone frame
+        For nucleotides: C1', C3', C4' atoms define the frame
+        For ligands: first 3 atoms or centroid-based frame
+        """
+        total_atoms = sum(token.num_atoms for token in tokens)
+        frame_atom_mask = np.zeros(total_atoms, dtype=np.float32)
+
+        # Frame atoms for each molecule type
+        PROTEIN_FRAME_ATOMS = {"N", "CA", "C"}
+        NUCLEIC_FRAME_ATOMS = {"C1'", "C3'", "C4'"}
+
+        atom_idx = 0
+        for token in tokens:
+            if token.token_type == TokenType.STANDARD_AMINO_ACID:
+                frame_atoms = PROTEIN_FRAME_ATOMS
+            elif token.token_type == TokenType.STANDARD_NUCLEOTIDE:
+                frame_atoms = NUCLEIC_FRAME_ATOMS
+            else:
+                # For ligands, use first 3 atoms as frame
+                frame_atoms = set(list(token.atoms.keys())[:3])
+
+            for atom_name in token.atoms.keys():
+                if atom_name in frame_atoms:
+                    frame_atom_mask[atom_idx] = 1.0
+                atom_idx += 1
+
+        return {"frame_atom_mask": frame_atom_mask}
+
+    def _extract_target_features(
+        self, tokens: List[Token]
+    ) -> Dict[str, np.ndarray]:
+        """Extract target features for training.
+
+        From AF3 Table 5:
+        - target_feat: One-hot encoding of target residue type
+
+        This is used during training to provide the ground truth
+        residue identity for structure prediction.
+        """
+        n_tokens = len(tokens)
+        target_feat = np.zeros((n_tokens, self.NUM_RESTYPES), dtype=np.float32)
+
+        for i, token in enumerate(tokens):
+            restype_idx = self._encode_restype(token)
+            target_feat[i, restype_idx] = 1.0
+
+        return {"target_feat": target_feat}
+
+    def _extract_pseudo_beta_features(
+        self, tokens: List[Token]
+    ) -> Dict[str, np.ndarray]:
+        """Extract pseudo-beta features for query structure.
+
+        From AF3 Table 5:
+        - pseudo_beta: CB position (CA for GLY) for each token
+        - pseudo_beta_mask: Validity mask for pseudo-beta positions
+
+        These are used for distance-based features and contact prediction.
+        """
+        n_tokens = len(tokens)
+        pseudo_beta = np.zeros((n_tokens, 3), dtype=np.float32)
+        pseudo_beta_mask = np.zeros(n_tokens, dtype=np.float32)
+
+        for i, token in enumerate(tokens):
+            pb_pos = self._get_pseudo_beta(token)
+            if pb_pos is not None:
+                pseudo_beta[i] = pb_pos
+                pseudo_beta_mask[i] = 1.0
+
+        return {
+            "pseudo_beta": pseudo_beta,
+            "pseudo_beta_mask": pseudo_beta_mask,
+        }
+
+    def _extract_backbone_rigid_features(
+        self, tokens: List[Token]
+    ) -> Dict[str, np.ndarray]:
+        """Extract backbone rigid body representation.
+
+        From AF3 Section 4.3.2:
+        - backbone_rigid_tensor: 4x4 transformation matrices for backbone frames
+        - backbone_rigid_mask: Validity mask for frames
+
+        The rigid body representation defines local coordinate systems
+        at each residue for the diffusion-based structure module.
+        """
+        n_tokens = len(tokens)
+        backbone_rigid_tensor = np.zeros((n_tokens, 4, 4), dtype=np.float32)
+        backbone_rigid_mask = np.zeros(n_tokens, dtype=np.float32)
+
+        for i, token in enumerate(tokens):
+            frame = self._compute_backbone_frame(token)
+            if frame is not None:
+                backbone_rigid_tensor[i] = frame
+                backbone_rigid_mask[i] = 1.0
+            else:
+                # Identity matrix as default
+                backbone_rigid_tensor[i] = np.eye(4, dtype=np.float32)
+
+        return {
+            "backbone_rigid_tensor": backbone_rigid_tensor,
+            "backbone_rigid_mask": backbone_rigid_mask,
+        }
+
+    def _compute_backbone_frame(self, token: Token) -> Optional[np.ndarray]:
+        """Compute 4x4 backbone frame transformation matrix.
+
+        For proteins: Frame defined by N, CA, C atoms
+        For nucleotides: Frame defined by C1', C3', C4' atoms
+        For ligands: Frame defined by first 3 atoms
+
+        Returns:
+            4x4 transformation matrix or None if cannot be computed
+        """
+        if token.token_type == TokenType.STANDARD_AMINO_ACID:
+            n_atom = token.atoms.get("N")
+            ca_atom = token.atoms.get("CA")
+            c_atom = token.atoms.get("C")
+
+            if n_atom is None or ca_atom is None or c_atom is None:
+                return None
+
+            n_pos = n_atom.coords
+            ca_pos = ca_atom.coords
+            c_pos = c_atom.coords
+
+        elif token.token_type == TokenType.STANDARD_NUCLEOTIDE:
+            c1_atom = token.atoms.get("C1'")
+            c3_atom = token.atoms.get("C3'")
+            c4_atom = token.atoms.get("C4'")
+
+            if c1_atom is None or c3_atom is None or c4_atom is None:
+                return None
+
+            # Use C4' as origin, C1' and C3' to define axes
+            n_pos = c3_atom.coords  # Analogous to N
+            ca_pos = c4_atom.coords  # Analogous to CA (origin)
+            c_pos = c1_atom.coords  # Analogous to C
+
+        else:
+            # For ligands, use first 3 atoms if available
+            atom_list = list(token.atoms.values())
+            if len(atom_list) < 3:
+                return None
+
+            n_pos = atom_list[0].coords
+            ca_pos = atom_list[1].coords
+            c_pos = atom_list[2].coords
+
+        # Build local coordinate frame at CA/C4'/atom2
+        # X-axis: CA -> C direction
+        x_axis = c_pos - ca_pos
+        x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-6:
+            return None
+        x_axis = x_axis / x_norm
+
+        # Y-axis: perpendicular in N-CA-C plane
+        n_to_ca = ca_pos - n_pos
+        y_axis = n_to_ca - np.dot(n_to_ca, x_axis) * x_axis
+        y_norm = np.linalg.norm(y_axis)
+        if y_norm < 1e-6:
+            return None
+        y_axis = y_axis / y_norm
+
+        # Z-axis: cross product (right-handed)
+        z_axis = np.cross(x_axis, y_axis)
+
+        # Build 4x4 transformation matrix
+        frame = np.eye(4, dtype=np.float32)
+        frame[:3, 0] = x_axis
+        frame[:3, 1] = y_axis
+        frame[:3, 2] = z_axis
+        frame[:3, 3] = ca_pos  # Translation (origin at CA)
+
+        return frame
+
+    def _extract_pair_features(
+        self, tokens: List[Token]
+    ) -> Dict[str, np.ndarray]:
+        """Extract pairwise token features.
+
+        From AF3 Table 5:
+        - relative_position: Relative sequence positions (clipped)
+        - same_chain: Mask for tokens in same chain
+        - same_entity: Mask for tokens in same entity
+        """
+        return compute_token_pair_features(tokens)
+
+    def _extract_msa_profile_features(
+        self, msa_arr: np.ndarray, msa_deletion_value: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Extract MSA profile features.
+
+        From AF3 Table 5:
+        - msa_profile: Distribution over residue types (Ntokens, 32)
+        - deletion_mean: Mean deletion count per position
+        - has_deletion: Binary deletion indicator
+        """
+        n_seqs, n_tokens = msa_arr.shape
+
+        # Compute profile (residue type distribution)
+        msa_profile = np.zeros((n_tokens, self.NUM_RESTYPES), dtype=np.float32)
+
+        for j in range(n_tokens):
+            for c in range(self.NUM_RESTYPES):
+                msa_profile[j, c] = np.sum(msa_arr[:, j] == c)
+
+        # Normalize with pseudocount
+        row_sums = msa_profile.sum(axis=1, keepdims=True) + 1e-8
+        msa_profile = msa_profile / row_sums
+
+        # Compute deletion features
+        deletion_mean = msa_deletion_value.mean(axis=0).astype(np.float32)
+        has_deletion = (msa_deletion_value > 0).any(axis=0).astype(np.float32)
+
+        return {
+            "msa_profile": msa_profile,
+            "deletion_mean": deletion_mean,
+            "has_deletion": has_deletion,
+        }
 
 
 def compute_relative_position_encoding(
