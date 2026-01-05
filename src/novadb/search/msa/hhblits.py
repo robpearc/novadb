@@ -212,3 +212,7 @@ class HHBlitsSearch:
             )
 
         return result
+
+
+# Alias for backward compatibility
+HHblitsRunner = HHBlitsSearch

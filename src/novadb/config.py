@@ -36,7 +36,8 @@ class DatabasePaths(BaseModel):
     """
 
     # PDB structure database
-    pdb_mmcif_dir: Path = Field(
+    pdb_mmcif_dir: Optional[Path] = Field(
+        default=None,
         description="Directory containing PDB mmCIF files"
     )
     pdb_seqres_fasta: Optional[Path] = Field(
@@ -245,6 +246,10 @@ class CroppingConfig(BaseModel):
     - Dataset-specific weights for strategy selection
     """
 
+    # Maximum sizes (from Table 4)
+    max_tokens: int = Field(default=384, description="Max tokens in crop (Ncrop_tokens)")
+    max_atoms: int = Field(default=4608, description="Max atoms in crop (Ncrop_atoms)")
+
     # Cropping weights for Weighted PDB / Disordered PDB
     pdb_contiguous_weight: float = Field(default=0.20)
     pdb_spatial_weight: float = Field(default=0.40)
@@ -355,7 +360,7 @@ class Config(BaseSettings):
     """Main configuration for the NovaDB pipeline."""
 
     # Sub-configurations
-    databases: DatabasePaths
+    databases: DatabasePaths = Field(default_factory=DatabasePaths)
     jackhmmer: JackhmmerConfig = Field(default_factory=JackhmmerConfig)
     hhblits: HHBlitsConfig = Field(default_factory=HHBlitsConfig)
     nhmmer: NhmmerConfig = Field(default_factory=NhmmerConfig)
@@ -391,3 +396,8 @@ class Config(BaseSettings):
     def to_dict(self) -> dict:
         """Convert configuration to dictionary."""
         return self.model_dump()
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Config":
+        """Create configuration from dictionary."""
+        return cls(**data)

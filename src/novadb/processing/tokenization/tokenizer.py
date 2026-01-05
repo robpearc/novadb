@@ -106,6 +106,11 @@ class Token:
         """Check if this is a nucleic acid token."""
         return self.token_type == TokenType.STANDARD_NUCLEOTIDE
 
+    @property
+    def atom_names(self) -> List[str]:
+        """Get names of all atoms in this token."""
+        return list(self.atoms.keys())
+
     def get_atom_coords(self) -> np.ndarray:
         """Get coordinates of all atoms as Nx3 array."""
         if not self.atoms:

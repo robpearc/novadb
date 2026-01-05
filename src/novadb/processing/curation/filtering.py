@@ -181,10 +181,10 @@ class StructureFilter:
         for chain in structure.chains.values():
             total_residues += len(chain.residues)
 
-        if total_residues < self.filtering.min_residues:
+        if total_residues < self.filtering.min_resolved_residues:
             return FilterResult(
                 passed=False,
-                reason=f"too few residues: {total_residues} < {self.filtering.min_residues}",
+                reason=f"too few residues: {total_residues} < {self.filtering.min_resolved_residues}",
             )
 
         return FilterResult(passed=True)

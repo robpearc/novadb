@@ -94,24 +94,19 @@ class DataPipeline:
         )
         self.tokenizer = Tokenizer()
         self.feature_extractor = FeatureExtractor(
-            max_msa_sequences=config.msa.max_msa_rows,
-            max_templates=config.templates.max_templates,
+            max_msa_sequences=config.msa_processing.max_msa_rows,
+            max_templates=config.template_search.max_templates,
         )
         self.cropper = Cropper(CropConfig(
-            max_tokens=config.cropping.max_tokens,
-            max_atoms=config.cropping.max_atoms,
-            contiguous_weight=config.cropping.contiguous_weight,
-            spatial_weight=config.cropping.spatial_weight,
-            spatial_interface_weight=config.cropping.spatial_interface_weight,
+            contiguous_weight=config.cropping.pdb_contiguous_weight,
+            spatial_weight=config.cropping.pdb_spatial_weight,
+            spatial_interface_weight=config.cropping.pdb_spatial_interface_weight,
         ))
 
         # MSA search tools (optional - require external databases)
         self.jackhmmer = None
         self.hhblits = None
-        self.msa_processor = MSAProcessor(
-            max_seqs=config.msa.max_msa_rows,
-            max_paired_seqs=config.msa.max_paired_rows,
-        )
+        self.msa_processor = MSAProcessor(config=config.msa_processing)
 
         # Template search (optional)
         self.template_searcher = None

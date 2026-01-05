@@ -384,6 +384,79 @@ class Cropper:
         idx = rng.choice(len(strategies), p=weights)
         return strategies[idx]
 
+    def contiguous_crop(
+        self,
+        tokenized: TokenizedStructure,
+        max_tokens: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> TokenizedStructure:
+        """Apply contiguous cropping strategy.
+
+        Args:
+            tokenized: Structure to crop
+            max_tokens: Maximum tokens in result
+            rng: Random number generator
+
+        Returns:
+            New TokenizedStructure with cropped tokens
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        temp_config = CropConfig(max_tokens=max_tokens)
+        temp_cropper = ContiguousCropper(temp_config)
+        result = temp_cropper.crop(tokenized, rng)
+
+        return self._apply_crop_result(tokenized, result)
+
+    def spatial_crop(
+        self,
+        tokenized: TokenizedStructure,
+        max_tokens: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> TokenizedStructure:
+        """Apply spatial cropping strategy.
+
+        Args:
+            tokenized: Structure to crop
+            max_tokens: Maximum tokens in result
+            rng: Random number generator
+
+        Returns:
+            New TokenizedStructure with cropped tokens
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        temp_config = CropConfig(max_tokens=max_tokens)
+        temp_cropper = SpatialCropper(temp_config)
+        result = temp_cropper.crop(tokenized, rng)
+
+        return self._apply_crop_result(tokenized, result)
+
+    def _apply_crop_result(
+        self,
+        tokenized: TokenizedStructure,
+        result: CropResult,
+    ) -> TokenizedStructure:
+        """Apply a crop result to create new TokenizedStructure."""
+        selected = set(result.token_indices)
+        new_tokens = []
+        for i, token in enumerate(tokenized.tokens):
+            if i in selected:
+                new_tokens.append(token)
+
+        # Renumber token indices
+        for i, token in enumerate(new_tokens):
+            token.token_index = i
+
+        return TokenizedStructure(
+            tokens=new_tokens,
+            pdb_id=tokenized.pdb_id,
+            chain_id_to_index=tokenized.chain_id_to_index,
+            entity_id_map=tokenized.entity_id_map,
+        )
+
     def crop_to_token_limit(
         self,
         tokenized: TokenizedStructure,

@@ -308,3 +308,7 @@ class NhmmerSearch:
             max_sequences=self.config.nt_max_seqs,
             n_cpu=n_cpu,
         )
+
+
+# Alias for backward compatibility
+NhmmerRunner = NhmmerSearch

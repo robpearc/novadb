@@ -268,3 +268,7 @@ class JackhmmerSearch:
             max_sequences=self.config.mgnify_max_seqs,
             n_cpu=n_cpu,
         )
+
+
+# Alias for backward compatibility
+JackhmmerRunner = JackhmmerSearch

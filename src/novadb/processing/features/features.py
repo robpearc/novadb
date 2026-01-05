@@ -42,7 +42,7 @@ class InputFeatures:
     asym_id: np.ndarray  # int32 (chain index)
     entity_id: np.ndarray  # int32
     sym_id: np.ndarray  # int32 (symmetry copy)
-    restype: np.ndarray  # int32 (one-hot 32 classes)
+    restype: np.ndarray  # float32 (Ntokens, 32) one-hot encoding
     is_protein: np.ndarray  # float32 mask
     is_rna: np.ndarray  # float32 mask
     is_dna: np.ndarray  # float32 mask
@@ -116,6 +116,11 @@ class InputFeatures:
     num_tokens: int = 0
     num_atoms: int = 0
     pdb_id: str = ""
+
+    @property
+    def ref_pos(self) -> Optional[np.ndarray]:
+        """Reference positions (alias for atom_ref_pos)."""
+        return self.atom_ref_pos
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -341,7 +346,7 @@ class FeatureExtractor:
         asym_id = np.zeros(n, dtype=np.int32)
         entity_id = np.zeros(n, dtype=np.int32)
         sym_id = np.zeros(n, dtype=np.int32)  # Always 0 for single copy
-        restype = np.zeros(n, dtype=np.int32)
+        restype = np.zeros((n, self.NUM_RESTYPES), dtype=np.float32)  # One-hot encoding
         is_protein = np.zeros(n, dtype=np.float32)
         is_rna = np.zeros(n, dtype=np.float32)
         is_dna = np.zeros(n, dtype=np.float32)
@@ -354,8 +359,9 @@ class FeatureExtractor:
             entity_id[i] = token.entity_id
             sym_id[i] = 0  # No symmetry expansion
 
-            # Encode residue type
-            restype[i] = self._encode_restype(token)
+            # Encode residue type as one-hot
+            restype_idx = self._encode_restype(token)
+            restype[i, restype_idx] = 1.0
 
             # Chain type masks
             if token.token_type == TokenType.STANDARD_AMINO_ACID:

@@ -114,6 +114,7 @@ def sample_structure():
         chains={"A": chain},
         resolution=2.0,
         method="X-RAY DIFFRACTION",
+        release_date="2020-01-01",
     )
     
     return structure
@@ -301,12 +302,12 @@ class TestFeatureExtractor:
         features = extractor.extract(tokenized)
         
         # ALA should be encoded as index 0
-        # GLY should be encoded as index 5
+        # GLY should be encoded as index 7 (3-letter alphabetical order)
         ala_idx = features.restype[0].argmax()
         gly_idx = features.restype[1].argmax()
-        
+
         assert ala_idx == 0  # ALA
-        assert gly_idx == 5  # GLY
+        assert gly_idx == 7  # GLY
     
     def test_reference_positions(self, sample_structure):
         """Test reference conformer positions."""
@@ -644,37 +645,37 @@ class TestConfig:
     def test_default_config(self):
         """Test default configuration values."""
         from novadb.config import Config
-        
+
         config = Config()
-        
-        assert config.cropping.max_tokens > 0
-        assert config.msa.max_msa_rows > 0
-        assert config.templates.max_templates > 0
-    
+
+        assert config.cropping.pdb_contiguous_weight > 0
+        assert config.msa_processing.max_msa_rows > 0
+        assert config.template_search.max_templates > 0
+
     def test_config_to_dict(self):
         """Test configuration serialization."""
         from novadb.config import Config
-        
+
         config = Config()
         d = config.to_dict()
-        
+
         assert isinstance(d, dict)
         assert "cropping" in d
-        assert "msa" in d
-    
+        assert "msa_processing" in d
+
     def test_config_from_dict(self):
         """Test configuration deserialization."""
         from novadb.config import Config
-        
+
         d = {
-            "cropping": {"max_tokens": 512},
-            "msa": {"max_msa_rows": 1000},
+            "cropping": {"pdb_contiguous_weight": 0.3},
+            "msa_processing": {"max_msa_rows": 1000},
         }
-        
+
         config = Config.from_dict(d)
-        
-        assert config.cropping.max_tokens == 512
-        assert config.msa.max_msa_rows == 1000
+
+        assert config.cropping.pdb_contiguous_weight == 0.3
+        assert config.msa_processing.max_msa_rows == 1000
 
 
 # =============================================================================
@@ -730,7 +731,8 @@ class TestPipelineIntegration:
         # Create pipeline with minimal config
         config = Config()
         config.storage.local_path = str(temp_dir / "output")
-        
+        config.filtering.min_resolved_residues = 1  # Allow small test structures
+
         pipeline = DataPipeline(config)
         
         # Process structure (without MSA/templates)

@@ -459,7 +459,7 @@ class BondFeatureExtractor:
         # Build token to residue mapping from tokenized structure
         token_to_residue = {}
         for i, token in enumerate(tokenized.tokens):
-            token_to_residue[i] = (token.chain_id, token.residue_idx)
+            token_to_residue[i] = (token.chain_id, token.residue_index)
         
         return self.extract(
             structure,
