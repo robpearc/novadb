@@ -47,7 +47,15 @@ from novadb.processing.features.reference_features import (
 )
 
 from novadb.processing.features.transforms import (
+    # Base classes
+    Transform,
+    BaseTransform,
+    Pipeline,
+    # Configs
     FeatureConfig,
+    DistogramConfig,
+    MSAConfig,
+    TemplateConfig,
     # Per-token transforms
     ResidueTypeEncodeTransform,
     TokenTypeEncodeTransform,
@@ -79,6 +87,12 @@ from novadb.processing.features.transforms import (
     compute_distogram_fast,
     compute_relative_positions_fast,
     extract_features_fast,
+    # Pipeline factory functions
+    create_token_pipeline,
+    create_atom_pipeline,
+    create_msa_pipeline,
+    create_template_pipeline,
+    create_full_pipeline,
 )
 
 __all__ = [
@@ -101,11 +115,18 @@ __all__ = [
     "MSAProfileExtractor",
     "TemplateFrameExtractor",
     "BondFeatureExtractor",
-    # Feature pipeline
+    # Feature pipeline (legacy)
     "FeatureEngineeringPipeline",
     "create_feature_pipeline",
-    # Config
+    # Base classes
+    "Transform",
+    "BaseTransform",
+    "Pipeline",
+    # Configs
     "FeatureConfig",
+    "DistogramConfig",
+    "MSAConfig",
+    "TemplateConfig",
     # Per-token transforms
     "ResidueTypeEncodeTransform",
     "TokenTypeEncodeTransform",
@@ -137,4 +158,10 @@ __all__ = [
     "compute_distogram_fast",
     "compute_relative_positions_fast",
     "extract_features_fast",
+    # Pipeline factory functions
+    "create_token_pipeline",
+    "create_atom_pipeline",
+    "create_msa_pipeline",
+    "create_template_pipeline",
+    "create_full_pipeline",
 ]
