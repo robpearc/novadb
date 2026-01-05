@@ -1,17 +1,18 @@
 """Cropping module for NovaDB.
 
 Provides cropping strategies for training data according to
-AlphaFold3 Section 2.7, with hierarchical transform implementations.
+AlphaFold3 Section 2.7, with composable transform implementations.
 
-Transform Hierarchy:
-- Per-Chain: ChainContiguousCropTransform, ChainCenterCoordsTransform
-- Per-Structure: ContiguousCropTransform, SpatialCropTransform, CropTransform
+Cropping Methods (Table 4):
+- ContiguousCropping: Sample contiguous segments across chains (AF-multimer Algorithm 1)
+- SpatialCropping: Select tokens nearest to a random reference token
+- SpatialInterfaceCropping: Select tokens nearest to interface tokens
 """
 
 from novadb.processing.cropping.cropping import (
     CroppingStrategy,
     CropConfig,
-    CropResult,
+    CropResult as CropperResult,
     Cropper,
     ContiguousCropper,
     SpatialCropper,
@@ -20,45 +21,68 @@ from novadb.processing.cropping.cropping import (
 )
 
 from novadb.processing.cropping.transforms import (
-    StructureCache,
-    # Per-chain transforms
-    ChainContiguousCropTransform,
-    ChainCenterCoordsTransform,
-    ChainInterfaceDetectTransform,
-    # Per-structure transforms
+    # Configuration
+    CropTransformConfig,
+    # Data structures
+    MoleculeInfo,
+    CropResult,
+    # Base class
+    BaseCropTransform,
+    # Preprocessing transforms
+    MoleculeInfoTransform,
+    TokenDistanceMatrixTransform,
+    InterfaceTokenTransform,
+    # Cropping transforms
     ContiguousCropTransform,
     SpatialCropTransform,
-    SpatialInterfaceCropTransform,
+    CombinedCropTransform,
+    ApplyCropTransform,
+    # Legacy compatibility
     CropTransform,
     CropToTokenLimitTransform,
     # Utility functions
     compute_distances_fast,
-    find_interface_contacts_fast,
+    identify_molecule_types,
+    get_interface_tokens,
+    # Pipeline factory
+    create_crop_pipeline,
+    apply_crop_pipeline,
 )
 
 __all__ = [
-    # Legacy classes
+    # Legacy cropper classes
     "CroppingStrategy",
     "CropConfig",
-    "CropResult",
+    "CropperResult",
     "Cropper",
     "ContiguousCropper",
     "SpatialCropper",
     "SpatialInterfaceCropper",
     "check_atom_limit",
-    # Caching
-    "StructureCache",
-    # Per-chain transforms
-    "ChainContiguousCropTransform",
-    "ChainCenterCoordsTransform",
-    "ChainInterfaceDetectTransform",
-    # Per-structure transforms
+    # Configuration
+    "CropTransformConfig",
+    # Data structures
+    "MoleculeInfo",
+    "CropResult",
+    # Base class
+    "BaseCropTransform",
+    # Preprocessing transforms
+    "MoleculeInfoTransform",
+    "TokenDistanceMatrixTransform",
+    "InterfaceTokenTransform",
+    # Cropping transforms
     "ContiguousCropTransform",
     "SpatialCropTransform",
-    "SpatialInterfaceCropTransform",
+    "CombinedCropTransform",
+    "ApplyCropTransform",
+    # Legacy compatibility
     "CropTransform",
     "CropToTokenLimitTransform",
     # Utility functions
     "compute_distances_fast",
-    "find_interface_contacts_fast",
+    "identify_molecule_types",
+    "get_interface_tokens",
+    # Pipeline factory
+    "create_crop_pipeline",
+    "apply_crop_pipeline",
 ]

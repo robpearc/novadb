@@ -1,17 +1,31 @@
 """Cropping transforms for NovaDB.
 
 Provides composable transforms for structure cropping following AF3 Section 2.7.
+Based on ByteDance/Protenix cropping implementation.
+
+Cropping Methods (Table 4):
+- ContiguousCropping: Sample contiguous segments across chains (AF-multimer Algorithm 1)
+- SpatialCropping: Select tokens nearest to a random reference token
+- SpatialInterfaceCropping: Select tokens nearest to interface tokens
+
+Key Features:
+- Complete ligand/non-standard residue handling (don't fragment molecules)
+- Metal/ion removal option
+- Interface token detection (tokens within 15A of another chain)
+- ref_space_uid-based molecule boundary tracking
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
 try:
     from scipy.spatial import cKDTree
+    from scipy.spatial.distance import cdist
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
@@ -21,282 +35,53 @@ except ImportError:
 FeatureDict = Dict[str, Any]
 
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
+
 @dataclass
-class StructureCache:
-    """Cache for structure data during cropping.
+class CropTransformConfig:
+    """Configuration for cropping transforms.
 
-    Stores precomputed data to avoid redundant calculations.
+    From AF3 Section 2.7 and Table 4.
     """
+    max_tokens: int = 384
+    max_atoms: int = 4608
+    interface_distance: float = 15.0  # Distance threshold for interface detection
 
-    chain_centers: Optional[Dict[str, np.ndarray]] = None
-    chain_coords: Optional[Dict[str, np.ndarray]] = None
-    interface_pairs: Optional[List[Tuple[str, str]]] = None
-    kdtrees: Optional[Dict[str, Any]] = None
+    # Method weights: [contiguous, spatial, spatial_interface]
+    method_weights: Tuple[float, float, float] = (0.2, 0.4, 0.4)
 
-    def clear(self) -> None:
-        """Clear all cached data."""
-        self.chain_centers = None
-        self.chain_coords = None
-        self.interface_pairs = None
-        self.kdtrees = None
-
-
-class BaseCropTransform:
-    """Base class for cropping transforms."""
-
-    def __init__(self, max_tokens: int = 384, max_atoms: int = 16384):
-        self.max_tokens = max_tokens
-        self.max_atoms = max_atoms
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        raise NotImplementedError
+    # Ligand handling
+    crop_complete_ligand: bool = True  # Don't fragment ligands
+    drop_last_incomplete: bool = False  # Drop incomplete molecules at boundary
+    remove_metals: bool = False  # Remove single-atom metal ions
 
 
-class ChainContiguousCropTransform(BaseCropTransform):
-    """Crop contiguous segments from chains.
+# =============================================================================
+# Data Structures
+# =============================================================================
 
-    From AF3 Section 2.7: Sample contiguous crop from each chain.
+
+@dataclass
+class MoleculeInfo:
+    """Information about molecule types and boundaries.
+
+    Tracks ref_space_uid boundaries for complete molecule cropping.
     """
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        # Get chain information
-        chain_ids = data.get("chain_ids", [])
-        token_indices = data.get("token_index", np.array([]))
-
-        if len(token_indices) <= self.max_tokens:
-            data["crop_mask"] = np.ones(len(token_indices), dtype=bool)
-            return data
-
-        # Simple contiguous crop - take first max_tokens
-        crop_mask = np.zeros(len(token_indices), dtype=bool)
-        crop_mask[:self.max_tokens] = True
-
-        data["crop_mask"] = crop_mask
-        return data
-
-
-class ChainCenterCoordsTransform(BaseCropTransform):
-    """Compute center coordinates for each chain."""
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        atom_ref_pos = data.get("atom_ref_pos", np.zeros((0, 3)))
-        atom_to_token = data.get("atom_to_token", np.array([]))
-        asym_id = data.get("asym_id", np.array([]))
-
-        chain_centers = {}
-
-        if len(asym_id) > 0 and len(atom_ref_pos) > 0:
-            unique_chains = np.unique(asym_id)
-
-            for chain_idx in unique_chains:
-                # Get tokens in this chain
-                token_mask = asym_id == chain_idx
-                token_indices = np.where(token_mask)[0]
-
-                if len(token_indices) == 0:
-                    continue
-
-                # Get atoms for these tokens
-                atom_mask = np.isin(atom_to_token, token_indices)
-                chain_coords = atom_ref_pos[atom_mask]
-
-                if len(chain_coords) > 0:
-                    chain_centers[int(chain_idx)] = chain_coords.mean(axis=0)
-
-        data["chain_centers"] = chain_centers
-        return data
-
-
-class ChainInterfaceDetectTransform(BaseCropTransform):
-    """Detect interfaces between chains.
-
-    From AF3 Section 2.7: Identify chain pairs with contacts.
-    """
-
-    def __init__(
-        self,
-        max_tokens: int = 384,
-        max_atoms: int = 16384,
-        contact_threshold: float = 8.0,
-    ):
-        super().__init__(max_tokens, max_atoms)
-        self.contact_threshold = contact_threshold
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        chain_centers = data.get("chain_centers", {})
-
-        interface_pairs = []
-
-        chain_ids = sorted(chain_centers.keys())
-        for i, chain_i in enumerate(chain_ids):
-            for chain_j in chain_ids[i+1:]:
-                center_i = chain_centers[chain_i]
-                center_j = chain_centers[chain_j]
-
-                dist = np.linalg.norm(center_i - center_j)
-
-                # Use a larger threshold for center-based detection
-                if dist < self.contact_threshold * 5:
-                    interface_pairs.append((chain_i, chain_j))
-
-        data["interface_pairs"] = interface_pairs
-        return data
-
-
-class ContiguousCropTransform(BaseCropTransform):
-    """Apply contiguous cropping to structure.
-
-    From AF3 Section 2.7: Sample start points uniformly.
-    """
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        n_tokens = data.get("num_tokens", 0)
-
-        if n_tokens <= self.max_tokens:
-            data["crop_start"] = 0
-            data["crop_end"] = n_tokens
-            return data
-
-        # Random start point
-        max_start = n_tokens - self.max_tokens
-        start = np.random.randint(0, max_start + 1)
-
-        data["crop_start"] = start
-        data["crop_end"] = start + self.max_tokens
-        return data
-
-
-class SpatialCropTransform(BaseCropTransform):
-    """Apply spatial cropping to structure.
-
-    From AF3 Section 2.7: Crop based on spatial proximity.
-    """
-
-    def __init__(
-        self,
-        max_tokens: int = 384,
-        max_atoms: int = 16384,
-        seed_selection: str = "random",
-    ):
-        super().__init__(max_tokens, max_atoms)
-        self.seed_selection = seed_selection
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        pseudo_beta = data.get("pseudo_beta", np.zeros((0, 3)))
-        pseudo_beta_mask = data.get("pseudo_beta_mask", np.array([]))
-        n_tokens = len(pseudo_beta)
-
-        if n_tokens <= self.max_tokens:
-            data["crop_indices"] = np.arange(n_tokens)
-            return data
-
-        # Select seed token
-        valid_indices = np.where(pseudo_beta_mask > 0)[0]
-        if len(valid_indices) == 0:
-            valid_indices = np.arange(n_tokens)
-
-        if self.seed_selection == "random":
-            seed_idx = np.random.choice(valid_indices)
-        else:
-            seed_idx = valid_indices[0]
-
-        # Compute distances from seed
-        seed_pos = pseudo_beta[seed_idx]
-        distances = np.linalg.norm(pseudo_beta - seed_pos, axis=1)
-
-        # Select closest tokens
-        sorted_indices = np.argsort(distances)
-        crop_indices = sorted_indices[:self.max_tokens]
-
-        data["crop_indices"] = np.sort(crop_indices)
-        return data
-
-
-class SpatialInterfaceCropTransform(BaseCropTransform):
-    """Crop around interface regions.
-
-    From AF3 Section 2.7: Focus on chain-chain interfaces.
-    """
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        interface_pairs = data.get("interface_pairs", [])
-        chain_centers = data.get("chain_centers", {})
-        pseudo_beta = data.get("pseudo_beta", np.zeros((0, 3)))
-        asym_id = data.get("asym_id", np.array([]))
-
-        n_tokens = len(pseudo_beta)
-
-        if n_tokens <= self.max_tokens or not interface_pairs:
-            data["crop_indices"] = np.arange(min(n_tokens, self.max_tokens))
-            return data
-
-        # Select random interface
-        chain_i, chain_j = interface_pairs[np.random.randint(len(interface_pairs))]
-
-        # Get interface center
-        if chain_i in chain_centers and chain_j in chain_centers:
-            interface_center = (chain_centers[chain_i] + chain_centers[chain_j]) / 2
-        else:
-            interface_center = pseudo_beta.mean(axis=0)
-
-        # Compute distances
-        distances = np.linalg.norm(pseudo_beta - interface_center, axis=1)
-
-        # Select closest tokens
-        sorted_indices = np.argsort(distances)
-        crop_indices = sorted_indices[:self.max_tokens]
-
-        data["crop_indices"] = np.sort(crop_indices)
-        return data
-
-
-class CropTransform(BaseCropTransform):
-    """Combined cropping transform.
-
-    Selects between contiguous and spatial cropping based on structure.
-    """
-
-    def __init__(
-        self,
-        max_tokens: int = 384,
-        max_atoms: int = 16384,
-        spatial_crop_prob: float = 0.5,
-    ):
-        super().__init__(max_tokens, max_atoms)
-        self.spatial_crop_prob = spatial_crop_prob
-        self.contiguous = ContiguousCropTransform(max_tokens, max_atoms)
-        self.spatial = SpatialCropTransform(max_tokens, max_atoms)
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        if np.random.random() < self.spatial_crop_prob:
-            return self.spatial(data)
-        else:
-            return self.contiguous(data)
-
-
-class CropToTokenLimitTransform(BaseCropTransform):
-    """Ensure structure fits within token limit.
-
-    Final transform to guarantee size constraints.
-    """
-
-    def __call__(self, data: FeatureDict) -> FeatureDict:
-        n_tokens = data.get("num_tokens", 0)
-
-        if n_tokens <= self.max_tokens:
-            return data
-
-        # Apply crop indices if available
-        if "crop_indices" in data:
-            crop_indices = data["crop_indices"][:self.max_tokens]
-            data["crop_indices"] = crop_indices
-            data["num_tokens"] = len(crop_indices)
-        else:
-            # Simple truncation
-            data["crop_indices"] = np.arange(self.max_tokens)
-            data["num_tokens"] = self.max_tokens
-
-        return data
+    is_metal: np.ndarray  # (N_tokens,) bool mask for metal ions
+    first_indices: np.ndarray  # (N_tokens,) first token index for each uid
+    last_indices: np.ndarray  # (N_tokens,) last token index for each uid
+    atom_counts: np.ndarray  # (N_tokens,) atom count per uid
+
+
+@dataclass
+class CropResult:
+    """Result of a cropping operation."""
+    selected_indices: np.ndarray  # Selected token indices
+    reference_token_idx: int = -1  # Reference token used (for spatial crops)
+    method: str = ""  # Cropping method used
 
 
 # =============================================================================
@@ -321,7 +106,6 @@ def compute_distances_fast(
         coords2 = coords1
 
     if HAS_SCIPY:
-        from scipy.spatial.distance import cdist
         return cdist(coords1, coords2, metric='euclidean')
     else:
         # Fallback to broadcasting
@@ -329,38 +113,853 @@ def compute_distances_fast(
         return np.sqrt(np.sum(diff ** 2, axis=-1))
 
 
-def find_interface_contacts_fast(
-    coords1: np.ndarray,
-    coords2: np.ndarray,
-    threshold: float = 8.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Find contacts between two sets of coordinates.
+def identify_molecule_types(
+    ref_space_uid: np.ndarray,
+    atom_counts: np.ndarray,
+    chain_id: np.ndarray,
+    chain_lengths: np.ndarray,
+) -> MoleculeInfo:
+    """Identify molecule types and track uid boundaries.
+
+    Identifies metals (single atom in single-residue chain) and tracks
+    first/last indices for each unique ref_space_uid.
 
     Args:
-        coords1: First coordinates (N, 3)
-        coords2: Second coordinates (M, 3)
-        threshold: Contact distance threshold
+        ref_space_uid: Unique ID for each token's residue (N_tokens,)
+        atom_counts: Number of atoms per token (N_tokens,)
+        chain_id: Chain ID for each token (N_tokens,)
+        chain_lengths: Length of each chain (N_chains,)
 
     Returns:
-        Tuple of (indices1, indices2) for contacting pairs
+        MoleculeInfo with masks and indices
     """
-    if len(coords1) == 0 or len(coords2) == 0:
-        return np.array([]), np.array([])
+    n_tokens = len(ref_space_uid)
+    is_metal = np.zeros(n_tokens, dtype=bool)
+    first_indices = np.zeros(n_tokens, dtype=np.int64)
+    last_indices = np.zeros(n_tokens, dtype=np.int64)
 
-    if HAS_SCIPY:
-        tree = cKDTree(coords2)
-        contacts = tree.query_ball_point(coords1, threshold)
+    # Get unique uids and their counts
+    unique_uids, inverse, counts = np.unique(
+        ref_space_uid, return_inverse=True, return_counts=True
+    )
 
-        idx1 = []
-        idx2 = []
-        for i, contact_list in enumerate(contacts):
-            for j in contact_list:
-                idx1.append(i)
-                idx2.append(j)
+    for i, (uid, count) in enumerate(zip(unique_uids, counts)):
+        mask = ref_space_uid == uid
+        indices = np.where(mask)[0]
+        first_idx = indices[0]
+        last_idx = indices[-1]
 
-        return np.array(idx1), np.array(idx2)
-    else:
-        # Fallback
-        distances = compute_distances_fast(coords1, coords2)
-        idx1, idx2 = np.where(distances < threshold)
-        return idx1, idx2
+        first_indices[mask] = first_idx
+        last_indices[mask] = last_idx
+
+        # Metal: single occurrence, single atom, in single-residue chain
+        if count == 1:
+            token_chain = chain_id[mask][0]
+            if token_chain < len(chain_lengths):
+                if chain_lengths[int(token_chain)] == 1:
+                    if atom_counts[mask][0] == 1:
+                        is_metal[mask] = True
+
+    return MoleculeInfo(
+        is_metal=is_metal,
+        first_indices=first_indices,
+        last_indices=last_indices,
+        atom_counts=atom_counts,
+    )
+
+
+def get_interface_tokens(
+    chain_id: np.ndarray,
+    reference_chain_ids: np.ndarray,
+    token_distances: np.ndarray,
+    distance_mask: np.ndarray,
+    interface_distance: float = 15.0,
+) -> np.ndarray:
+    """Find tokens in contact with other chains.
+
+    Args:
+        chain_id: Chain ID for each token (N_tokens,)
+        reference_chain_ids: Chain IDs to find interfaces for
+        token_distances: Distance matrix (N_ref_tokens, N_all_tokens)
+        distance_mask: Valid distance mask (N_ref_tokens, N_all_tokens)
+        interface_distance: Distance threshold for interface
+
+    Returns:
+        Indices of interface tokens within reference chains
+    """
+    n_tokens = len(chain_id)
+    n_ref = token_distances.shape[0]
+
+    # Get reference token mask
+    ref_mask = np.isin(chain_id, reference_chain_ids)
+    ref_indices = np.where(ref_mask)[0]
+
+    if len(ref_indices) == 0:
+        return np.array([], dtype=np.int64)
+
+    # Distance threshold mask
+    close_mask = token_distances < interface_distance
+
+    # Different chain mask (for each ref token, check if target is different chain)
+    ref_chain_ids = chain_id[ref_indices]
+    diff_chain_mask = chain_id[np.newaxis, :] != ref_chain_ids[:, np.newaxis]
+
+    # Combine masks: close + different chain + valid distance
+    interface_mask = close_mask & diff_chain_mask & distance_mask
+
+    # Tokens with any interface contact
+    has_interface = interface_mask.any(axis=1)
+    interface_indices = ref_indices[has_interface]
+
+    return interface_indices
+
+
+# =============================================================================
+# Base Transform
+# =============================================================================
+
+
+class BaseCropTransform:
+    """Base class for cropping transforms."""
+
+    def __init__(self, config: Optional[CropTransformConfig] = None):
+        self.config = config or CropTransformConfig()
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        raise NotImplementedError
+
+    def _get_token_coords(self, data: FeatureDict) -> np.ndarray:
+        """Get representative coordinates for each token."""
+        # Prefer centre_atom_coords if available
+        if "centre_atom_coords" in data:
+            return data["centre_atom_coords"]
+
+        # Fall back to pseudo_beta
+        if "pseudo_beta" in data:
+            return data["pseudo_beta"]
+
+        # Compute from atom positions
+        atom_ref_pos = data.get("atom_ref_pos", np.zeros((0, 3)))
+        atom_to_token = data.get("atom_to_token", np.array([]))
+        n_tokens = data.get("num_tokens", 0)
+
+        if len(atom_ref_pos) == 0 or n_tokens == 0:
+            return np.zeros((n_tokens, 3))
+
+        coords = np.zeros((n_tokens, 3))
+        for i in range(n_tokens):
+            atom_mask = atom_to_token == i
+            if atom_mask.any():
+                coords[i] = atom_ref_pos[atom_mask].mean(axis=0)
+
+        return coords
+
+
+# =============================================================================
+# Molecule Info Transform
+# =============================================================================
+
+
+class MoleculeInfoTransform(BaseCropTransform):
+    """Extract molecule type information for cropping.
+
+    Computes ref_space_uid boundaries and identifies metals.
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        ref_space_uid = data.get("ref_space_uid", np.array([]))
+        chain_id = data.get("asym_id", np.array([]))
+        n_tokens = data.get("num_tokens", len(chain_id))
+
+        if n_tokens == 0:
+            data["molecule_info"] = None
+            return data
+
+        # Compute atom counts per token
+        atom_to_token = data.get("atom_to_token", np.array([]))
+        atom_counts = np.zeros(n_tokens, dtype=np.int64)
+        if len(atom_to_token) > 0:
+            for i in range(n_tokens):
+                atom_counts[i] = np.sum(atom_to_token == i)
+        else:
+            atom_counts[:] = 1  # Default
+
+        # Get chain lengths
+        unique_chains = np.unique(chain_id)
+        chain_lengths = np.zeros(int(unique_chains.max()) + 1 if len(unique_chains) > 0 else 1)
+        for c in unique_chains:
+            chain_lengths[int(c)] = np.sum(chain_id == c)
+
+        # Use token indices as ref_space_uid if not provided
+        if len(ref_space_uid) == 0:
+            ref_space_uid = np.arange(n_tokens)
+
+        mol_info = identify_molecule_types(
+            ref_space_uid=ref_space_uid,
+            atom_counts=atom_counts,
+            chain_id=chain_id,
+            chain_lengths=chain_lengths,
+        )
+
+        data["molecule_info"] = mol_info
+        data["ref_space_uid"] = ref_space_uid
+        return data
+
+
+# =============================================================================
+# Distance Matrix Transform
+# =============================================================================
+
+
+class TokenDistanceMatrixTransform(BaseCropTransform):
+    """Compute token-token distance matrix.
+
+    Can compute full matrix or partial matrix for reference chains only.
+    """
+
+    def __init__(
+        self,
+        config: Optional[CropTransformConfig] = None,
+        reference_chain_ids: Optional[np.ndarray] = None,
+    ):
+        super().__init__(config)
+        self.reference_chain_ids = reference_chain_ids
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        coords = self._get_token_coords(data)
+        chain_id = data.get("asym_id", np.array([]))
+        resolved_mask = data.get("is_resolved", np.ones(len(coords), dtype=bool))
+
+        n_tokens = len(coords)
+        if n_tokens == 0:
+            data["token_distances"] = np.zeros((0, 0))
+            data["distance_mask"] = np.zeros((0, 0), dtype=bool)
+            return data
+
+        # Determine reference tokens
+        if self.reference_chain_ids is not None:
+            ref_mask = np.isin(chain_id, self.reference_chain_ids)
+            ref_indices = np.where(ref_mask)[0]
+        else:
+            ref_indices = np.arange(n_tokens)
+
+        if len(ref_indices) == 0:
+            ref_indices = np.arange(n_tokens)
+
+        # Compute distances from reference tokens to all tokens
+        ref_coords = coords[ref_indices]
+        distances = compute_distances_fast(ref_coords, coords)
+
+        # Create distance mask (both tokens must be resolved)
+        ref_resolved = resolved_mask[ref_indices]
+        distance_mask = ref_resolved[:, np.newaxis] & resolved_mask[np.newaxis, :]
+
+        data["token_distances"] = distances
+        data["distance_mask"] = distance_mask
+        data["reference_token_indices"] = ref_indices
+
+        return data
+
+
+# =============================================================================
+# Interface Detection Transform
+# =============================================================================
+
+
+class InterfaceTokenTransform(BaseCropTransform):
+    """Detect interface tokens between chains.
+
+    Interface tokens are those within interface_distance of another chain.
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        chain_id = data.get("asym_id", np.array([]))
+        token_distances = data.get("token_distances", np.zeros((0, 0)))
+        distance_mask = data.get("distance_mask", np.zeros((0, 0), dtype=bool))
+        ref_indices = data.get("reference_token_indices", np.arange(len(chain_id)))
+
+        if len(chain_id) == 0:
+            data["interface_token_indices"] = np.array([], dtype=np.int64)
+            return data
+
+        # Get unique reference chain IDs
+        ref_chain_ids = np.unique(chain_id[ref_indices])
+
+        interface_indices = get_interface_tokens(
+            chain_id=chain_id,
+            reference_chain_ids=ref_chain_ids,
+            token_distances=token_distances,
+            distance_mask=distance_mask,
+            interface_distance=self.config.interface_distance,
+        )
+
+        # If no interface tokens found, use all resolved reference tokens
+        if len(interface_indices) == 0:
+            resolved_ref = ref_indices[distance_mask.any(axis=1)]
+            interface_indices = resolved_ref
+
+        data["interface_token_indices"] = interface_indices
+        return data
+
+
+# =============================================================================
+# Contiguous Cropping Transform
+# =============================================================================
+
+
+class ContiguousCropTransform(BaseCropTransform):
+    """Apply contiguous cropping across chains.
+
+    From AF-multimer Algorithm 1: Sample contiguous segments from each chain,
+    shuffling chain order and respecting molecule boundaries.
+
+    Features:
+    - Shuffles chain processing order
+    - Can preserve complete ligands/non-standard residues
+    - Can remove metal ions
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        chain_id = data.get("asym_id", np.array([]))
+        n_tokens = data.get("num_tokens", len(chain_id))
+        mol_info = data.get("molecule_info")
+        ref_space_uid = data.get("ref_space_uid", np.arange(n_tokens))
+
+        if n_tokens == 0:
+            data["crop_result"] = CropResult(
+                selected_indices=np.array([], dtype=np.int64),
+                method="ContiguousCropping",
+            )
+            return data
+
+        if n_tokens <= self.config.max_tokens:
+            data["crop_result"] = CropResult(
+                selected_indices=np.arange(n_tokens),
+                method="ContiguousCropping",
+            )
+            return data
+
+        # Get molecule info if not already computed
+        if mol_info is None:
+            mol_info_transform = MoleculeInfoTransform(self.config)
+            data = mol_info_transform(data)
+            mol_info = data["molecule_info"]
+
+        selected_indices = self._contiguous_crop(
+            n_tokens=n_tokens,
+            chain_id=chain_id,
+            ref_space_uid=ref_space_uid,
+            mol_info=mol_info,
+        )
+
+        data["crop_result"] = CropResult(
+            selected_indices=selected_indices,
+            method="ContiguousCropping",
+        )
+        return data
+
+    def _contiguous_crop(
+        self,
+        n_tokens: int,
+        chain_id: np.ndarray,
+        ref_space_uid: np.ndarray,
+        mol_info: MoleculeInfo,
+    ) -> np.ndarray:
+        """Perform contiguous cropping across chains."""
+        crop_size = self.config.max_tokens
+
+        # Get chain info
+        unique_chains = np.unique(chain_id)
+        chain_lengths = {int(c): np.sum(chain_id == c) for c in unique_chains}
+        chain_offsets = {}
+        for c in unique_chains:
+            chain_offsets[int(c)] = np.where(chain_id == c)[0][0]
+
+        # Shuffle chain order
+        shuffled_chains = np.random.permutation(unique_chains)
+
+        selected_indices = []
+        n_added = 0
+        n_remaining = n_tokens
+
+        if self.config.remove_metals and mol_info is not None:
+            n_remaining -= mol_info.is_metal.sum()
+
+        for chain in shuffled_chains:
+            chain = int(chain)
+            if n_added >= crop_size:
+                break
+
+            chain_offset = chain_offsets[chain]
+            chain_length = chain_lengths[chain]
+
+            # Skip metals if configured
+            if self.config.remove_metals and mol_info is not None:
+                if mol_info.is_metal[chain_offset]:
+                    continue
+
+            n_remaining -= chain_length
+
+            # Determine crop size for this chain
+            crop_size_min = min(
+                chain_length,
+                max(0, crop_size - (n_added + n_remaining))
+            )
+            crop_size_max = min(crop_size - n_added, chain_length)
+
+            if crop_size_min > crop_size_max:
+                continue
+
+            chain_crop_size = np.random.randint(crop_size_min, crop_size_max + 1)
+            chain_crop_start = np.random.randint(0, chain_length - chain_crop_size + 1)
+
+            start_idx = chain_offset + chain_crop_start
+            end_idx = chain_offset + chain_crop_start + chain_crop_size
+
+            # Adjust for complete molecules if configured
+            if self.config.crop_complete_ligand and mol_info is not None:
+                start_idx, end_idx = self._adjust_for_complete_molecules(
+                    start_idx, end_idx, crop_size_min, n_added,
+                    mol_info, crop_size
+                )
+                chain_crop_size = end_idx - start_idx
+
+            if start_idx < end_idx:
+                selected_indices.extend(range(start_idx, end_idx))
+                n_added += chain_crop_size
+
+        selected_indices = np.array(sorted(selected_indices), dtype=np.int64)
+        return selected_indices
+
+    def _adjust_for_complete_molecules(
+        self,
+        start_idx: int,
+        end_idx: int,
+        crop_size_min: int,
+        n_added: int,
+        mol_info: MoleculeInfo,
+        crop_size: int,
+    ) -> Tuple[int, int]:
+        """Adjust crop boundaries to keep molecules complete."""
+        if start_idx >= end_idx:
+            return start_idx, end_idx
+
+        first_indices = mol_info.first_indices
+        last_indices = mol_info.last_indices
+
+        # Check if start is in middle of a molecule
+        if first_indices[start_idx] != start_idx:
+            # Move to molecule boundary
+            left_start = first_indices[start_idx]
+            right_start = last_indices[start_idx] + 1
+
+            # Prefer starting at molecule boundary
+            if right_start <= end_idx:
+                start_idx = right_start
+            else:
+                start_idx = left_start
+
+        # Check if end is in middle of a molecule
+        if end_idx > 0 and last_indices[end_idx - 1] != end_idx - 1:
+            left_end = first_indices[end_idx - 1]
+            right_end = last_indices[end_idx - 1] + 1
+
+            # Check which boundary works
+            left_crop = left_end - start_idx
+            right_crop = right_end - start_idx
+
+            if left_crop >= crop_size_min and left_crop + n_added <= crop_size:
+                if right_crop >= crop_size_min and right_crop + n_added <= crop_size:
+                    # Both work, choose randomly
+                    end_idx = left_end if np.random.random() < 0.5 else right_end
+                else:
+                    end_idx = left_end
+            elif right_crop >= crop_size_min and right_crop + n_added <= crop_size:
+                end_idx = right_end
+            elif self.config.drop_last_incomplete:
+                # Walk back to find complete molecule
+                while end_idx > start_idx:
+                    if last_indices[end_idx - 1] == end_idx - 1:
+                        break
+                    end_idx = first_indices[end_idx - 1]
+
+        return start_idx, end_idx
+
+
+# =============================================================================
+# Spatial Cropping Transform
+# =============================================================================
+
+
+class SpatialCropTransform(BaseCropTransform):
+    """Apply spatial cropping based on distance to reference token.
+
+    Selects tokens nearest to a randomly chosen reference token.
+
+    Features:
+    - Random selection from resolved reference tokens
+    - Ties broken by token index (stability)
+    - Can preserve complete ligands
+    """
+
+    def __init__(
+        self,
+        config: Optional[CropTransformConfig] = None,
+        use_interface: bool = False,
+    ):
+        super().__init__(config)
+        self.use_interface = use_interface
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        n_tokens = data.get("num_tokens", 0)
+        token_distances = data.get("token_distances", np.zeros((0, 0)))
+        distance_mask = data.get("distance_mask", np.zeros((0, 0), dtype=bool))
+        ref_indices = data.get("reference_token_indices", np.arange(n_tokens))
+        ref_space_uid = data.get("ref_space_uid", np.arange(n_tokens))
+
+        if n_tokens == 0:
+            data["crop_result"] = CropResult(
+                selected_indices=np.array([], dtype=np.int64),
+                method="SpatialCropping" if not self.use_interface else "SpatialInterfaceCropping",
+            )
+            return data
+
+        if n_tokens <= self.config.max_tokens:
+            data["crop_result"] = CropResult(
+                selected_indices=np.arange(n_tokens),
+                method="SpatialCropping" if not self.use_interface else "SpatialInterfaceCropping",
+            )
+            return data
+
+        # For interface cropping, use interface tokens as reference
+        if self.use_interface:
+            interface_indices = data.get("interface_token_indices", np.array([]))
+            if len(interface_indices) > 0:
+                # Map interface indices to distance matrix rows
+                ref_to_row = {idx: i for i, idx in enumerate(ref_indices)}
+                valid_rows = [ref_to_row[idx] for idx in interface_indices if idx in ref_to_row]
+                if len(valid_rows) > 0:
+                    reference_rows = np.array(valid_rows)
+                else:
+                    reference_rows = np.where(distance_mask.any(axis=1))[0]
+            else:
+                reference_rows = np.where(distance_mask.any(axis=1))[0]
+        else:
+            # Use all resolved reference tokens
+            reference_rows = np.where(distance_mask.any(axis=1))[0]
+
+        if len(reference_rows) == 0:
+            # Fallback: use all tokens
+            data["crop_result"] = CropResult(
+                selected_indices=np.arange(min(n_tokens, self.config.max_tokens)),
+                method="SpatialCropping" if not self.use_interface else "SpatialInterfaceCropping",
+            )
+            return data
+
+        # Randomly select reference token
+        ref_row = reference_rows[np.random.randint(len(reference_rows))]
+        ref_token_idx = ref_indices[ref_row]
+
+        # Get distances from reference
+        distances = token_distances[ref_row].copy()
+
+        # Add small noise to break ties (by index)
+        noise = np.arange(len(distances)) * 1e-6
+        distances = distances + noise
+
+        # Mask unresolved tokens
+        valid_mask = distance_mask[ref_row]
+        distances[~valid_mask] = np.inf
+
+        # Select nearest tokens
+        crop_size = min(self.config.max_tokens, n_tokens)
+        nearest_indices = np.argsort(distances)[:crop_size]
+        selected_indices = np.sort(nearest_indices)
+
+        # Remove incomplete molecules if configured
+        if self.config.crop_complete_ligand:
+            selected_indices = self._drop_incomplete_molecules(
+                selected_indices, ref_space_uid
+            )
+
+        data["crop_result"] = CropResult(
+            selected_indices=selected_indices,
+            reference_token_idx=int(ref_token_idx),
+            method="SpatialCropping" if not self.use_interface else "SpatialInterfaceCropping",
+        )
+        return data
+
+    def _drop_incomplete_molecules(
+        self,
+        selected_indices: np.ndarray,
+        ref_space_uid: np.ndarray,
+    ) -> np.ndarray:
+        """Remove tokens from incompletely selected molecules."""
+        if len(selected_indices) == 0:
+            return selected_indices
+
+        selected_uids = ref_space_uid[selected_indices]
+
+        # Find all uids in full array
+        all_uids = set(ref_space_uid)
+
+        # Find uids that are partially selected
+        selected_set = set(selected_indices)
+        incomplete_uids = set()
+
+        for uid in np.unique(selected_uids):
+            uid_indices = np.where(ref_space_uid == uid)[0]
+            if not all(idx in selected_set for idx in uid_indices):
+                incomplete_uids.add(uid)
+
+        # Remove incomplete molecules
+        if incomplete_uids:
+            mask = ~np.isin(selected_uids, list(incomplete_uids))
+            selected_indices = selected_indices[mask]
+
+        return selected_indices
+
+
+# =============================================================================
+# Combined Cropping Transform
+# =============================================================================
+
+
+class CombinedCropTransform(BaseCropTransform):
+    """Combined cropping with method selection.
+
+    Randomly selects between cropping methods based on weights:
+    - ContiguousCropping: [weight_0]
+    - SpatialCropping: [weight_1]
+    - SpatialInterfaceCropping: [weight_2]
+    """
+
+    def __init__(
+        self,
+        config: Optional[CropTransformConfig] = None,
+        reference_chain_ids: Optional[np.ndarray] = None,
+    ):
+        super().__init__(config)
+        self.reference_chain_ids = reference_chain_ids
+
+        # Initialize sub-transforms
+        self.mol_info_transform = MoleculeInfoTransform(config)
+        self.distance_transform = TokenDistanceMatrixTransform(
+            config, reference_chain_ids
+        )
+        self.interface_transform = InterfaceTokenTransform(config)
+        self.contiguous_transform = ContiguousCropTransform(config)
+        self.spatial_transform = SpatialCropTransform(config, use_interface=False)
+        self.spatial_interface_transform = SpatialCropTransform(config, use_interface=True)
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        n_tokens = data.get("num_tokens", 0)
+
+        if n_tokens <= self.config.max_tokens:
+            data["crop_result"] = CropResult(
+                selected_indices=np.arange(n_tokens),
+                method="NoCrop",
+            )
+            return data
+
+        # Randomly select method
+        method = self._select_method()
+
+        # Run preprocessing transforms
+        data = self.mol_info_transform(data)
+
+        if method == "ContiguousCropping":
+            data = self.contiguous_transform(data)
+        else:
+            # Spatial methods need distance matrix
+            data = self.distance_transform(data)
+
+            if method == "SpatialInterfaceCropping":
+                data = self.interface_transform(data)
+                data = self.spatial_interface_transform(data)
+            else:
+                data = self.spatial_transform(data)
+
+        return data
+
+    def _select_method(self) -> str:
+        """Select cropping method based on weights."""
+        methods = ["ContiguousCropping", "SpatialCropping", "SpatialInterfaceCropping"]
+        weights = self.config.method_weights
+
+        # Normalize weights
+        total = sum(weights)
+        if total <= 0:
+            return methods[0]
+
+        probs = [w / total for w in weights]
+        return np.random.choice(methods, p=probs)
+
+
+# =============================================================================
+# Apply Crop Transform
+# =============================================================================
+
+
+class ApplyCropTransform(BaseCropTransform):
+    """Apply crop result to data features.
+
+    Takes crop_result from previous transform and filters all features.
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        crop_result = data.get("crop_result")
+        if crop_result is None:
+            return data
+
+        selected_indices = crop_result.selected_indices
+        if len(selected_indices) == 0:
+            return data
+
+        # Apply to token-level features
+        token_features = [
+            "token_index", "residue_index", "asym_id", "entity_id",
+            "restype", "is_protein", "is_rna", "is_dna", "is_ligand",
+            "pseudo_beta", "pseudo_beta_mask", "backbone_rigid_tensor",
+            "backbone_rigid_mask", "ref_space_uid", "centre_atom_coords",
+            "is_resolved",
+        ]
+
+        for key in token_features:
+            if key in data and data[key] is not None:
+                arr = data[key]
+                if isinstance(arr, np.ndarray) and len(arr) > 0:
+                    if arr.ndim >= 1 and arr.shape[0] > max(selected_indices):
+                        data[key] = arr[selected_indices]
+
+        # Apply to pair features
+        pair_features = ["relative_position", "same_chain", "same_entity"]
+        for key in pair_features:
+            if key in data and data[key] is not None:
+                arr = data[key]
+                if isinstance(arr, np.ndarray) and arr.ndim == 2:
+                    data[key] = arr[np.ix_(selected_indices, selected_indices)]
+
+        # Apply to MSA features
+        msa_features = ["msa", "msa_mask", "msa_deletion_value"]
+        for key in msa_features:
+            if key in data and data[key] is not None:
+                arr = data[key]
+                if isinstance(arr, np.ndarray) and arr.ndim >= 2:
+                    data[key] = arr[:, selected_indices]
+
+        # Apply to template features
+        template_features = ["template_restype", "template_pseudo_beta",
+                           "template_pseudo_beta_mask", "template_backbone_mask"]
+        for key in template_features:
+            if key in data and data[key] is not None:
+                arr = data[key]
+                if isinstance(arr, np.ndarray) and arr.ndim >= 2:
+                    data[key] = arr[:, selected_indices]
+
+        # Update metadata
+        data["num_tokens"] = len(selected_indices)
+        data["crop_method"] = crop_result.method
+        data["reference_token_idx"] = crop_result.reference_token_idx
+
+        return data
+
+
+# =============================================================================
+# Pipeline Factory
+# =============================================================================
+
+
+def create_crop_pipeline(
+    config: Optional[CropTransformConfig] = None,
+    reference_chain_ids: Optional[np.ndarray] = None,
+) -> List[BaseCropTransform]:
+    """Create a standard cropping pipeline.
+
+    Args:
+        config: Cropping configuration
+        reference_chain_ids: Chain IDs for reference (spatial cropping)
+
+    Returns:
+        List of transforms to apply in order
+    """
+    config = config or CropTransformConfig()
+
+    return [
+        CombinedCropTransform(config, reference_chain_ids),
+        ApplyCropTransform(config),
+    ]
+
+
+def apply_crop_pipeline(
+    data: FeatureDict,
+    pipeline: List[BaseCropTransform],
+) -> FeatureDict:
+    """Apply a cropping pipeline to data.
+
+    Args:
+        data: Feature dictionary
+        pipeline: List of transforms
+
+    Returns:
+        Transformed data
+    """
+    for transform in pipeline:
+        data = transform(data)
+    return data
+
+
+# =============================================================================
+# Legacy Compatibility
+# =============================================================================
+
+
+class CropTransform(BaseCropTransform):
+    """Legacy combined cropping transform.
+
+    Maintained for backward compatibility.
+    """
+
+    def __init__(
+        self,
+        max_tokens: int = 384,
+        max_atoms: int = 4608,
+        spatial_crop_prob: float = 0.5,
+    ):
+        config = CropTransformConfig(
+            max_tokens=max_tokens,
+            max_atoms=max_atoms,
+            method_weights=(1 - spatial_crop_prob, spatial_crop_prob, 0.0),
+        )
+        super().__init__(config)
+        self._combined = CombinedCropTransform(config)
+        self._apply = ApplyCropTransform(config)
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        data = self._combined(data)
+        data = self._apply(data)
+        return data
+
+
+class CropToTokenLimitTransform(BaseCropTransform):
+    """Ensure structure fits within token limit.
+
+    Final transform to guarantee size constraints.
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        n_tokens = data.get("num_tokens", 0)
+
+        if n_tokens <= self.config.max_tokens:
+            return data
+
+        # Simple truncation if no crop result
+        if "crop_result" not in data:
+            data["crop_result"] = CropResult(
+                selected_indices=np.arange(self.config.max_tokens),
+                method="Truncation",
+            )
+
+        # Apply crop
+        apply_transform = ApplyCropTransform(self.config)
+        return apply_transform(data)

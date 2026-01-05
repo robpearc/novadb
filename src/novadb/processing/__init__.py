@@ -93,16 +93,31 @@ from novadb.processing.cropping import (
     CropConfig,
     CropResult,
     Cropper,
-    # Per-chain
-    ChainContiguousCropTransform,
-    ChainCenterCoordsTransform,
-    ChainInterfaceDetectTransform,
-    # Per-structure
-    CropTransform,
-    CropToTokenLimitTransform,
+    # Configuration
+    CropTransformConfig,
+    # Data structures
+    MoleculeInfo,
+    # Base class
+    BaseCropTransform,
+    # Preprocessing transforms
+    MoleculeInfoTransform,
+    TokenDistanceMatrixTransform,
+    InterfaceTokenTransform,
+    # Cropping transforms
     ContiguousCropTransform,
     SpatialCropTransform,
-    SpatialInterfaceCropTransform,
+    CombinedCropTransform,
+    ApplyCropTransform,
+    # Legacy compatibility
+    CropTransform,
+    CropToTokenLimitTransform,
+    # Utility functions
+    compute_distances_fast,
+    identify_molecule_types,
+    get_interface_tokens,
+    # Pipeline factory
+    create_crop_pipeline,
+    apply_crop_pipeline,
 )
 
 # Curation
@@ -246,14 +261,23 @@ __all__ = [
     "CropConfig",
     "CropResult",
     "Cropper",
-    "ChainContiguousCropTransform",
-    "ChainCenterCoordsTransform",
-    "ChainInterfaceDetectTransform",
-    "CropTransform",
-    "CropToTokenLimitTransform",
+    "CropTransformConfig",
+    "MoleculeInfo",
+    "BaseCropTransform",
+    "MoleculeInfoTransform",
+    "TokenDistanceMatrixTransform",
+    "InterfaceTokenTransform",
     "ContiguousCropTransform",
     "SpatialCropTransform",
-    "SpatialInterfaceCropTransform",
+    "CombinedCropTransform",
+    "ApplyCropTransform",
+    "CropTransform",
+    "CropToTokenLimitTransform",
+    "compute_distances_fast",
+    "identify_molecule_types",
+    "get_interface_tokens",
+    "create_crop_pipeline",
+    "apply_crop_pipeline",
     # Curation
     "FilterResult",
     "StructureFilter",
