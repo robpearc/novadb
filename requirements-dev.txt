@@ -1,0 +1,48 @@
+# NovaDB Development Dependencies
+#
+# Install with: pip install -r requirements-dev.txt
+# This includes all base requirements plus development tools
+
+# Include base requirements
+-r requirements.txt
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+pytest-xdist>=3.3.0        # Parallel test execution
+pytest-timeout>=2.1.0       # Test timeouts
+hypothesis>=6.82.0          # Property-based testing
+
+# Code formatting and linting
+black>=23.7.0
+ruff>=0.0.280
+isort>=5.12.0
+
+# Type checking
+mypy>=1.4.0
+types-requests>=2.31.0
+types-PyYAML>=6.0.0
+types-tqdm>=4.65.0
+
+# Pre-commit hooks
+pre-commit>=3.3.0
+
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.2.0
+sphinx-autodoc-typehints>=1.23.0
+myst-parser>=2.0.0
+
+# Debugging and profiling
+ipython>=8.14.0
+ipdb>=0.13.0
+memory-profiler>=0.61.0
+line-profiler>=4.0.0
+
+# Jupyter support (optional)
+jupyter>=1.0.0
+jupyterlab>=4.0.0
+
+# Performance optimizations (optional)
+numba>=0.58.0

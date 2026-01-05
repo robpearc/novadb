@@ -1,0 +1,1098 @@
+"""Reference conformer and advanced feature extraction for AlphaFold3.
+
+Implements additional features from AF3 Supplement Table 5:
+- Reference conformer features (ref_pos, ref_mask, ref_element, etc.)
+- MSA profile features (msa_profile, deletion_mean)
+- Template frame features (template_backbone_frame)
+- Bond features (token_bonds, polymer-ligand bonds)
+- Atom-to-token mapping with proper handling
+
+Reference: AF3 Supplement Section 2.8 and Table 5
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Constants from AF3
+NUM_RESIDUE_TYPES = 32
+NUM_ELEMENT_TYPES = 128
+NUM_ATOM_NAME_CHARS = 64
+ATOM_NAME_LENGTH = 4
+NUM_DISTANCE_BINS = 39
+DISTANCE_BIN_MIN = 3.25
+DISTANCE_BIN_MAX = 50.75
+
+
+@dataclass(frozen=True)
+class ReferenceConformerConfig:
+    """Configuration for reference conformer feature extraction.
+    
+    From AF3 Table 5: Reference conformers provide idealized
+    geometry for each residue type.
+    
+    Attributes:
+        ccd_dir: Directory containing CCD conformer files.
+        use_ideal_coords: Whether to use ideal (vs model) coordinates.
+        include_hydrogens: Whether to include hydrogen atoms.
+        max_atoms_per_token: Maximum atoms per token.
+    """
+    
+    ccd_dir: Optional[Path] = None
+    use_ideal_coords: bool = True
+    include_hydrogens: bool = False
+    max_atoms_per_token: int = 37
+
+
+@dataclass(frozen=True)
+class MSAProfileConfig:
+    """Configuration for MSA profile computation.
+    
+    From AF3 Table 5: MSA profile is a 32-dimensional distribution
+    over residue types at each position.
+    
+    Attributes:
+        num_classes: Number of residue type classes.
+        pseudocount: Pseudocount for smoothing.
+        use_deletion_mean: Whether to compute deletion mean.
+    """
+    
+    num_classes: int = NUM_RESIDUE_TYPES
+    pseudocount: float = 1e-8
+    use_deletion_mean: bool = True
+
+
+@dataclass(frozen=True)
+class BondFeatureConfig:
+    """Configuration for bond feature extraction.
+    
+    From AF3 Table 5: Token bonds encode connectivity between
+    polymer residues and with ligands.
+    
+    Attributes:
+        include_polymer_bonds: Include bonds between polymer residues.
+        include_ligand_bonds: Include bonds to/from ligands.
+        include_disulfide_bonds: Include cysteine disulfide bonds.
+        bond_distance_threshold: Maximum distance for bond detection.
+    """
+    
+    include_polymer_bonds: bool = True
+    include_ligand_bonds: bool = True
+    include_disulfide_bonds: bool = True
+    bond_distance_threshold: float = 2.5
+
+
+@dataclass
+class ReferenceConformerFeatures:
+    """Reference conformer features for a structure.
+    
+    From AF3 Table 5: These features provide the idealized
+    geometry from CCD for each residue.
+    
+    Attributes:
+        ref_pos: Reference atom positions (Natoms, 3).
+        ref_mask: Reference position validity mask (Natoms,).
+        ref_element: One-hot element encoding (Natoms, 128).
+        ref_charge: Formal atomic charge (Natoms,).
+        ref_atom_name_chars: 4-char atom names (Natoms, 4, 64).
+        ref_space_uid: Unique residue identifier (Natoms,).
+        atom_to_token: Mapping from atoms to tokens (Natoms,).
+    """
+    
+    ref_pos: np.ndarray
+    ref_mask: np.ndarray
+    ref_element: np.ndarray
+    ref_charge: np.ndarray
+    ref_atom_name_chars: np.ndarray
+    ref_space_uid: np.ndarray
+    atom_to_token: np.ndarray
+
+
+@dataclass
+class MSAProfileFeatures:
+    """MSA profile and deletion features.
+    
+    From AF3 Table 5: Profile is the distribution over residue
+    types in the MSA at each position.
+    
+    Attributes:
+        msa_profile: Residue type distribution (Ntokens, 32).
+        deletion_mean: Mean deletion count per position (Ntokens,).
+        has_deletion: Binary deletion indicator per position (Ntokens,).
+        deletion_value: Transformed deletion value (Ntokens,).
+    """
+    
+    msa_profile: np.ndarray
+    deletion_mean: np.ndarray
+    has_deletion: np.ndarray
+    deletion_value: np.ndarray
+
+
+@dataclass
+class TemplateFrameFeatures:
+    """Template backbone frame features.
+    
+    From AF3 Table 5: Template frames define local coordinate
+    systems for each residue.
+    
+    Attributes:
+        template_backbone_frame: Backbone frames (Ntemplate, Ntokens, 4, 4).
+        template_backbone_frame_mask: Frame validity (Ntemplate, Ntokens).
+        template_distogram: Pairwise distance bins (Ntemplate, Ntokens, Ntokens, Nbins).
+        template_unit_vector: Inter-residue vectors (Ntemplate, Ntokens, Ntokens, 3).
+    """
+    
+    template_backbone_frame: np.ndarray
+    template_backbone_frame_mask: np.ndarray
+    template_distogram: np.ndarray
+    template_unit_vector: Optional[np.ndarray] = None
+
+
+@dataclass
+class BondFeatures:
+    """Bond connectivity features.
+    
+    From AF3 Table 5: Token bonds encode which tokens are
+    covalently bonded.
+    
+    Attributes:
+        token_bonds: Sparse bond matrix (Ntokens, Ntokens).
+        bond_types: Bond type encoding (Ntokens, Ntokens).
+        polymer_ligand_bonds: Bonds between polymer and ligand (Nbonds, 2).
+    """
+    
+    token_bonds: np.ndarray
+    bond_types: Optional[np.ndarray] = None
+    polymer_ligand_bonds: Optional[np.ndarray] = None
+
+
+# Element encoding (periodic table order, 0-indexed)
+ELEMENTS = [
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
+    "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
+    "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd",
+    "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
+    "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+    "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+    "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm",
+    "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds",
+    "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
+]
+ELEMENT_TO_INDEX = {e: i for i, e in enumerate(ELEMENTS)}
+
+# Atom name character encoding
+ATOM_NAME_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' *+-_"
+CHAR_TO_INDEX = {c: i for i, c in enumerate(ATOM_NAME_ALPHABET)}
+
+
+@dataclass
+class ReferenceConformerExtractor:
+    """Extracts reference conformer features from structures.
+    
+    From AF3 Table 5: Reference conformers provide idealized
+    atomic coordinates from the Chemical Component Dictionary (CCD).
+    
+    Attributes:
+        config: Extraction configuration.
+        _ccd_cache: Cached CCD conformer data.
+    """
+    
+    config: ReferenceConformerConfig = field(default_factory=ReferenceConformerConfig)
+    _ccd_cache: Dict[str, Dict] = field(default_factory=dict, repr=False)
+    
+    def extract(
+        self,
+        residue_names: Sequence[str],
+        atom_coords: Sequence[np.ndarray],
+        atom_elements: Sequence[Sequence[str]],
+        atom_names: Sequence[Sequence[str]],
+        atom_charges: Optional[Sequence[Sequence[float]]] = None,
+    ) -> ReferenceConformerFeatures:
+        """Extract reference conformer features.
+        
+        Args:
+            residue_names: Residue name for each token.
+            atom_coords: Atom coordinates for each token.
+            atom_elements: Element symbols for each token's atoms.
+            atom_names: Atom names for each token's atoms.
+            atom_charges: Optional formal charges for atoms.
+            
+        Returns:
+            ReferenceConformerFeatures with all ref_* features.
+        """
+        num_tokens = len(residue_names)
+        
+        # Count total atoms
+        total_atoms = sum(len(coords) for coords in atom_coords)
+        
+        # Initialize arrays
+        ref_pos = np.zeros((total_atoms, 3), dtype=np.float32)
+        ref_mask = np.zeros(total_atoms, dtype=np.float32)
+        ref_element = np.zeros((total_atoms, NUM_ELEMENT_TYPES), dtype=np.int32)
+        ref_charge = np.zeros(total_atoms, dtype=np.float32)
+        ref_atom_name_chars = np.zeros(
+            (total_atoms, ATOM_NAME_LENGTH, NUM_ATOM_NAME_CHARS),
+            dtype=np.int32,
+        )
+        ref_space_uid = np.zeros(total_atoms, dtype=np.int32)
+        atom_to_token = np.zeros(total_atoms, dtype=np.int32)
+        
+        atom_idx = 0
+        
+        for token_idx in range(num_tokens):
+            coords = atom_coords[token_idx]
+            elements = atom_elements[token_idx]
+            names = atom_names[token_idx]
+            charges = atom_charges[token_idx] if atom_charges else None
+            
+            num_atoms = len(coords)
+            
+            for i in range(num_atoms):
+                # Position
+                ref_pos[atom_idx] = coords[i]
+                ref_mask[atom_idx] = 1.0
+                
+                # Element (one-hot)
+                elem = elements[i] if i < len(elements) else "C"
+                elem_idx = ELEMENT_TO_INDEX.get(elem.upper(), 0)
+                ref_element[atom_idx, elem_idx] = 1
+                
+                # Charge
+                if charges is not None and i < len(charges):
+                    ref_charge[atom_idx] = charges[i]
+                
+                # Atom name (4 chars, each one-hot encoded)
+                name = names[i] if i < len(names) else "UNK"
+                self._encode_atom_name(name, ref_atom_name_chars[atom_idx])
+                
+                # Space UID (unique per residue)
+                ref_space_uid[atom_idx] = token_idx
+                
+                # Atom-to-token mapping
+                atom_to_token[atom_idx] = token_idx
+                
+                atom_idx += 1
+        
+        return ReferenceConformerFeatures(
+            ref_pos=ref_pos,
+            ref_mask=ref_mask,
+            ref_element=ref_element,
+            ref_charge=ref_charge,
+            ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
+            atom_to_token=atom_to_token,
+        )
+    
+    def extract_from_ccd(
+        self,
+        residue_name: str,
+    ) -> Optional[Dict]:
+        """Extract reference conformer from CCD.
+        
+        Args:
+            residue_name: 3-letter residue code.
+            
+        Returns:
+            Dictionary with ideal coordinates and atom info.
+        """
+        if residue_name in self._ccd_cache:
+            return self._ccd_cache[residue_name]
+        
+        if self.config.ccd_dir is None:
+            return None
+        
+        ccd_file = self.config.ccd_dir / f"{residue_name}.cif"
+        if not ccd_file.exists():
+            return None
+        
+        try:
+            conformer = self._parse_ccd_file(ccd_file)
+            self._ccd_cache[residue_name] = conformer
+            return conformer
+        except Exception as e:
+            logger.warning("Failed to parse CCD file for %s: %s", residue_name, e)
+            return None
+    
+    def _encode_atom_name(
+        self,
+        name: str,
+        output: np.ndarray,
+    ) -> None:
+        """Encode atom name to 4x64 one-hot array.
+        
+        Args:
+            name: Atom name (up to 4 characters).
+            output: Output array of shape (4, 64).
+        """
+        padded = name.ljust(ATOM_NAME_LENGTH)[:ATOM_NAME_LENGTH].upper()
+        for i, char in enumerate(padded):
+            char_idx = CHAR_TO_INDEX.get(char, 0)
+            output[i, char_idx] = 1
+    
+    def _parse_ccd_file(self, ccd_file: Path) -> Dict:
+        """Parse CCD conformer file.
+        
+        Args:
+            ccd_file: Path to CCD file.
+            
+        Returns:
+            Dictionary with atom coordinates and properties.
+        """
+        atoms = []
+        coords_ideal = []
+        coords_model = []
+        elements = []
+        charges = []
+        
+        with open(ccd_file) as f:
+            in_atom_block = False
+            
+            for line in f:
+                if "_chem_comp_atom." in line:
+                    in_atom_block = True
+                    continue
+                
+                if in_atom_block and line.startswith("#"):
+                    break
+                
+                if in_atom_block and not line.startswith("_"):
+                    parts = line.split()
+                    if len(parts) >= 10:
+                        atom_name = parts[1]
+                        element = parts[2]
+                        charge = float(parts[3]) if parts[3] not in (".", "?") else 0.0
+                        
+                        # Ideal coordinates
+                        x_ideal = float(parts[4]) if parts[4] not in (".", "?") else 0.0
+                        y_ideal = float(parts[5]) if parts[5] not in (".", "?") else 0.0
+                        z_ideal = float(parts[6]) if parts[6] not in (".", "?") else 0.0
+                        
+                        atoms.append(atom_name)
+                        elements.append(element)
+                        charges.append(charge)
+                        coords_ideal.append([x_ideal, y_ideal, z_ideal])
+        
+        return {
+            "atoms": atoms,
+            "elements": elements,
+            "charges": charges,
+            "coords_ideal": np.array(coords_ideal, dtype=np.float32) if coords_ideal else np.zeros((0, 3)),
+        }
+
+
+@dataclass
+class MSAProfileExtractor:
+    """Extracts MSA profile and deletion features.
+    
+    From AF3 Table 5: MSA profile encodes the residue type
+    distribution at each position across the MSA.
+    
+    Attributes:
+        config: Extraction configuration.
+    """
+    
+    config: MSAProfileConfig = field(default_factory=MSAProfileConfig)
+    
+    # Residue type mapping (same as AF3)
+    AA_TO_INDEX = {
+        "A": 0, "R": 1, "N": 2, "D": 3, "C": 4,
+        "Q": 5, "E": 6, "G": 7, "H": 8, "I": 9,
+        "L": 10, "K": 11, "M": 12, "F": 13, "P": 14,
+        "S": 15, "T": 16, "W": 17, "Y": 18, "V": 19,
+        "X": 20,  # Unknown
+    }
+    GAP_INDEX = 31
+    
+    def extract(
+        self,
+        msa_array: np.ndarray,
+        deletion_matrix: Optional[np.ndarray] = None,
+    ) -> MSAProfileFeatures:
+        """Extract MSA profile and deletion features.
+        
+        Args:
+            msa_array: MSA as integer array (Nmsa, Ntokens).
+            deletion_matrix: Deletion counts (Nmsa, Ntokens).
+            
+        Returns:
+            MSAProfileFeatures with profile and deletion info.
+        """
+        n_seqs, n_tokens = msa_array.shape
+        n_classes = self.config.num_classes
+        
+        # Compute profile (residue type distribution)
+        msa_profile = np.zeros((n_tokens, n_classes), dtype=np.float32)
+        
+        for j in range(n_tokens):
+            for c in range(n_classes):
+                msa_profile[j, c] = np.sum(msa_array[:, j] == c)
+        
+        # Normalize with pseudocount
+        row_sums = msa_profile.sum(axis=1, keepdims=True) + self.config.pseudocount
+        msa_profile = msa_profile / row_sums
+        
+        # Compute deletion features
+        if deletion_matrix is not None:
+            deletion_mean = deletion_matrix.mean(axis=0).astype(np.float32)
+            has_deletion = (deletion_matrix > 0).any(axis=0).astype(np.float32)
+            # Transform: 2/π * arctan(d/3)
+            deletion_value = (2.0 / np.pi) * np.arctan(deletion_mean / 3.0)
+        else:
+            deletion_mean = np.zeros(n_tokens, dtype=np.float32)
+            has_deletion = np.zeros(n_tokens, dtype=np.float32)
+            deletion_value = np.zeros(n_tokens, dtype=np.float32)
+        
+        return MSAProfileFeatures(
+            msa_profile=msa_profile,
+            deletion_mean=deletion_mean,
+            has_deletion=has_deletion,
+            deletion_value=deletion_value,
+        )
+    
+    def extract_from_sequences(
+        self,
+        sequences: Sequence[str],
+        deletions: Optional[Sequence[Sequence[int]]] = None,
+    ) -> MSAProfileFeatures:
+        """Extract profile from sequence strings.
+        
+        Args:
+            sequences: List of aligned sequence strings.
+            deletions: Optional deletion counts per sequence.
+            
+        Returns:
+            MSAProfileFeatures.
+        """
+        if not sequences:
+            return MSAProfileFeatures(
+                msa_profile=np.zeros((0, self.config.num_classes), dtype=np.float32),
+                deletion_mean=np.zeros(0, dtype=np.float32),
+                has_deletion=np.zeros(0, dtype=np.float32),
+                deletion_value=np.zeros(0, dtype=np.float32),
+            )
+        
+        n_seqs = len(sequences)
+        n_tokens = len(sequences[0])
+        
+        # Convert sequences to integer array
+        msa_array = np.zeros((n_seqs, n_tokens), dtype=np.int32)
+        
+        for i, seq in enumerate(sequences):
+            for j, char in enumerate(seq):
+                msa_array[i, j] = self._char_to_index(char)
+        
+        # Convert deletions
+        deletion_matrix = None
+        if deletions is not None:
+            deletion_matrix = np.zeros((n_seqs, n_tokens), dtype=np.int32)
+            for i, dels in enumerate(deletions):
+                for j, d in enumerate(dels[:n_tokens]):
+                    deletion_matrix[i, j] = d
+        
+        return self.extract(msa_array, deletion_matrix)
+    
+    def _char_to_index(self, char: str) -> int:
+        """Convert character to residue type index."""
+        char = char.upper()
+        if char in self.AA_TO_INDEX:
+            return self.AA_TO_INDEX[char]
+        if char == "-":
+            return self.GAP_INDEX
+        return self.AA_TO_INDEX["X"]
+
+
+@dataclass
+class TemplateFrameExtractor:
+    """Extracts template backbone frame features.
+    
+    From AF3 Table 5 and Section 4.3.2: Template frames define
+    local coordinate systems at each residue.
+    
+    Attributes:
+        num_distance_bins: Number of distance histogram bins.
+        distance_min: Minimum distance for binning.
+        distance_max: Maximum distance for binning.
+    """
+    
+    num_distance_bins: int = NUM_DISTANCE_BINS
+    distance_min: float = DISTANCE_BIN_MIN
+    distance_max: float = DISTANCE_BIN_MAX
+    
+    def extract(
+        self,
+        template_coords: np.ndarray,
+        template_mask: np.ndarray,
+        num_tokens: int,
+    ) -> TemplateFrameFeatures:
+        """Extract template frame features.
+        
+        Args:
+            template_coords: Template atom coordinates (Ntemplate, Ntokens, 3, 3).
+                For proteins: N, CA, C positions.
+                For nucleotides: C1', C3', C4' positions.
+            template_mask: Template validity mask (Ntemplate, Ntokens).
+            num_tokens: Number of tokens in query.
+            
+        Returns:
+            TemplateFrameFeatures.
+        """
+        n_templates = template_coords.shape[0]
+        
+        # Compute backbone frames
+        backbone_frame = np.zeros(
+            (n_templates, num_tokens, 4, 4),
+            dtype=np.float32,
+        )
+        backbone_frame_mask = np.zeros(
+            (n_templates, num_tokens),
+            dtype=np.float32,
+        )
+        
+        for t in range(n_templates):
+            for i in range(min(num_tokens, template_coords.shape[1])):
+                if template_mask[t, i] > 0:
+                    frame = self._compute_frame(template_coords[t, i])
+                    if frame is not None:
+                        backbone_frame[t, i] = frame
+                        backbone_frame_mask[t, i] = 1.0
+        
+        # Compute distogram
+        distogram = self._compute_distogram(
+            template_coords[:, :, 1, :],  # Use CA/C1' positions
+            template_mask,
+            num_tokens,
+        )
+        
+        # Compute unit vectors
+        unit_vector = self._compute_unit_vectors(
+            template_coords[:, :, 1, :],
+            template_mask,
+            num_tokens,
+        )
+        
+        return TemplateFrameFeatures(
+            template_backbone_frame=backbone_frame,
+            template_backbone_frame_mask=backbone_frame_mask,
+            template_distogram=distogram,
+            template_unit_vector=unit_vector,
+        )
+    
+    def _compute_frame(
+        self,
+        coords: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Compute 4x4 transformation matrix from backbone atoms.
+        
+        Args:
+            coords: Backbone atom coordinates (3, 3) for N, CA, C.
+            
+        Returns:
+            4x4 transformation matrix or None if invalid.
+        """
+        if np.any(np.isnan(coords)) or np.any(np.isinf(coords)):
+            return None
+        
+        # Extract N, CA, C
+        n_pos = coords[0]
+        ca_pos = coords[1]
+        c_pos = coords[2]
+        
+        # Build local frame at CA
+        # X-axis: CA -> C direction
+        x_axis = c_pos - ca_pos
+        x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-6:
+            return None
+        x_axis = x_axis / x_norm
+        
+        # Y-axis: perpendicular in N-CA-C plane
+        n_to_ca = ca_pos - n_pos
+        y_axis = n_to_ca - np.dot(n_to_ca, x_axis) * x_axis
+        y_norm = np.linalg.norm(y_axis)
+        if y_norm < 1e-6:
+            return None
+        y_axis = y_axis / y_norm
+        
+        # Z-axis: cross product
+        z_axis = np.cross(x_axis, y_axis)
+        
+        # Build 4x4 matrix
+        frame = np.eye(4, dtype=np.float32)
+        frame[:3, 0] = x_axis
+        frame[:3, 1] = y_axis
+        frame[:3, 2] = z_axis
+        frame[:3, 3] = ca_pos
+        
+        return frame
+    
+    def _compute_distogram(
+        self,
+        positions: np.ndarray,
+        mask: np.ndarray,
+        num_tokens: int,
+    ) -> np.ndarray:
+        """Compute pairwise distance histogram.
+        
+        Args:
+            positions: Representative positions (Ntemplate, Ntokens, 3).
+            mask: Validity mask (Ntemplate, Ntokens).
+            num_tokens: Number of tokens.
+            
+        Returns:
+            Distogram (Ntemplate, Ntokens, Ntokens, Nbins).
+        """
+        n_templates = positions.shape[0]
+        n_bins = self.num_distance_bins
+        
+        distogram = np.zeros(
+            (n_templates, num_tokens, num_tokens, n_bins),
+            dtype=np.float32,
+        )
+        
+        bin_edges = np.linspace(
+            self.distance_min,
+            self.distance_max,
+            n_bins + 1,
+        )
+        
+        for t in range(n_templates):
+            n_pos = min(num_tokens, positions.shape[1])
+            
+            # Compute pairwise distances
+            diff = positions[t, :n_pos, None, :] - positions[t, None, :n_pos, :]
+            distances = np.sqrt(np.sum(diff ** 2, axis=-1))
+            
+            # Create pair mask
+            pair_mask = mask[t, :n_pos, None] * mask[t, None, :n_pos]
+            
+            # Bin distances
+            for b in range(n_bins):
+                in_bin = (distances >= bin_edges[b]) & (distances < bin_edges[b + 1])
+                distogram[t, :n_pos, :n_pos, b] = in_bin * pair_mask
+        
+        return distogram
+    
+    def _compute_unit_vectors(
+        self,
+        positions: np.ndarray,
+        mask: np.ndarray,
+        num_tokens: int,
+    ) -> np.ndarray:
+        """Compute unit vectors between residue pairs.
+        
+        Args:
+            positions: Representative positions (Ntemplate, Ntokens, 3).
+            mask: Validity mask (Ntemplate, Ntokens).
+            num_tokens: Number of tokens.
+            
+        Returns:
+            Unit vectors (Ntemplate, Ntokens, Ntokens, 3).
+        """
+        n_templates = positions.shape[0]
+        
+        unit_vector = np.zeros(
+            (n_templates, num_tokens, num_tokens, 3),
+            dtype=np.float32,
+        )
+        
+        for t in range(n_templates):
+            n_pos = min(num_tokens, positions.shape[1])
+            
+            # Compute direction vectors
+            diff = positions[t, :n_pos, None, :] - positions[t, None, :n_pos, :]
+            distances = np.sqrt(np.sum(diff ** 2, axis=-1, keepdims=True))
+            distances = np.maximum(distances, 1e-8)  # Avoid division by zero
+            
+            unit_vec = diff / distances
+            
+            # Apply mask
+            pair_mask = mask[t, :n_pos, None] * mask[t, None, :n_pos]
+            unit_vector[t, :n_pos, :n_pos] = unit_vec * pair_mask[:, :, None]
+        
+        return unit_vector
+
+
+@dataclass
+class BondFeatureExtractor:
+    """Extracts bond connectivity features.
+    
+    From AF3 Table 5: Token bonds encode covalent connections
+    between tokens (residues/atoms).
+    
+    Attributes:
+        config: Bond feature configuration.
+    """
+    
+    config: BondFeatureConfig = field(default_factory=BondFeatureConfig)
+    
+    # Bond type encoding
+    BOND_TYPE_NONE = 0
+    BOND_TYPE_POLYMER = 1
+    BOND_TYPE_LIGAND = 2
+    BOND_TYPE_DISULFIDE = 3
+    
+    def extract(
+        self,
+        chain_ids: Sequence[str],
+        residue_indices: Sequence[int],
+        residue_names: Sequence[str],
+        atom_coords: Optional[Sequence[np.ndarray]] = None,
+    ) -> BondFeatures:
+        """Extract bond features.
+        
+        Args:
+            chain_ids: Chain ID for each token.
+            residue_indices: Residue index for each token.
+            residue_names: Residue name for each token.
+            atom_coords: Optional atom coordinates for distance-based detection.
+            
+        Returns:
+            BondFeatures with connectivity information.
+        """
+        num_tokens = len(chain_ids)
+        
+        token_bonds = np.zeros((num_tokens, num_tokens), dtype=np.int32)
+        bond_types = np.zeros((num_tokens, num_tokens), dtype=np.int32)
+        
+        # Detect polymer bonds (sequential residues in same chain)
+        if self.config.include_polymer_bonds:
+            self._add_polymer_bonds(
+                token_bonds,
+                bond_types,
+                chain_ids,
+                residue_indices,
+                residue_names,
+            )
+        
+        # Detect disulfide bonds
+        if self.config.include_disulfide_bonds and atom_coords is not None:
+            self._add_disulfide_bonds(
+                token_bonds,
+                bond_types,
+                residue_names,
+                atom_coords,
+            )
+        
+        # Detect ligand bonds
+        polymer_ligand_bonds = None
+        if self.config.include_ligand_bonds and atom_coords is not None:
+            polymer_ligand_bonds = self._detect_ligand_bonds(
+                residue_names,
+                atom_coords,
+            )
+        
+        return BondFeatures(
+            token_bonds=token_bonds,
+            bond_types=bond_types,
+            polymer_ligand_bonds=polymer_ligand_bonds,
+        )
+    
+    def _add_polymer_bonds(
+        self,
+        token_bonds: np.ndarray,
+        bond_types: np.ndarray,
+        chain_ids: Sequence[str],
+        residue_indices: Sequence[int],
+        residue_names: Sequence[str],
+    ) -> None:
+        """Add polymer backbone bonds.
+        
+        Args:
+            token_bonds: Bond matrix to update.
+            bond_types: Bond type matrix to update.
+            chain_ids: Chain ID for each token.
+            residue_indices: Residue index for each token.
+            residue_names: Residue name for each token.
+        """
+        num_tokens = len(chain_ids)
+        
+        # Standard amino acids and nucleotides form polymer bonds
+        polymer_residues = {
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+            "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+            "A", "G", "C", "U", "DA", "DG", "DC", "DT",
+        }
+        
+        for i in range(num_tokens - 1):
+            j = i + 1
+            
+            # Check if same chain and sequential
+            if chain_ids[i] != chain_ids[j]:
+                continue
+            
+            if residue_indices[j] - residue_indices[i] != 1:
+                continue
+            
+            # Check if both are polymer residues
+            if residue_names[i] not in polymer_residues:
+                continue
+            if residue_names[j] not in polymer_residues:
+                continue
+            
+            # Add bond
+            token_bonds[i, j] = 1
+            token_bonds[j, i] = 1
+            bond_types[i, j] = self.BOND_TYPE_POLYMER
+            bond_types[j, i] = self.BOND_TYPE_POLYMER
+    
+    def _add_disulfide_bonds(
+        self,
+        token_bonds: np.ndarray,
+        bond_types: np.ndarray,
+        residue_names: Sequence[str],
+        atom_coords: Sequence[np.ndarray],
+    ) -> None:
+        """Add cysteine disulfide bonds.
+        
+        Args:
+            token_bonds: Bond matrix to update.
+            bond_types: Bond type matrix to update.
+            residue_names: Residue name for each token.
+            atom_coords: Atom coordinates for each token.
+        """
+        # Find cysteine residues
+        cys_indices = [
+            i for i, name in enumerate(residue_names)
+            if name == "CYS"
+        ]
+        
+        # Check SG-SG distances
+        for i, idx_i in enumerate(cys_indices):
+            for idx_j in cys_indices[i + 1:]:
+                sg_i = self._get_sg_position(atom_coords[idx_i])
+                sg_j = self._get_sg_position(atom_coords[idx_j])
+                
+                if sg_i is None or sg_j is None:
+                    continue
+                
+                distance = np.linalg.norm(sg_i - sg_j)
+                
+                # Typical disulfide S-S distance is ~2.05 Å
+                if distance < 2.5:
+                    token_bonds[idx_i, idx_j] = 1
+                    token_bonds[idx_j, idx_i] = 1
+                    bond_types[idx_i, idx_j] = self.BOND_TYPE_DISULFIDE
+                    bond_types[idx_j, idx_i] = self.BOND_TYPE_DISULFIDE
+    
+    def _get_sg_position(
+        self,
+        coords: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Get SG atom position from cysteine coordinates.
+        
+        Args:
+            coords: Atom coordinates for residue.
+            
+        Returns:
+            SG position or None.
+        """
+        # Simplified: assume SG is at index 5 (after N, CA, C, O, CB)
+        if len(coords) > 5:
+            return coords[5]
+        return None
+    
+    def _detect_ligand_bonds(
+        self,
+        residue_names: Sequence[str],
+        atom_coords: Sequence[np.ndarray],
+    ) -> np.ndarray:
+        """Detect bonds between polymer and ligand atoms.
+        
+        Args:
+            residue_names: Residue name for each token.
+            atom_coords: Atom coordinates for each token.
+            
+        Returns:
+            Array of (polymer_token, ligand_token) bond pairs.
+        """
+        polymer_residues = {
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+            "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+            "A", "G", "C", "U", "DA", "DG", "DC", "DT",
+        }
+        
+        # Identify polymer and ligand tokens
+        polymer_tokens = [
+            i for i, name in enumerate(residue_names)
+            if name in polymer_residues
+        ]
+        ligand_tokens = [
+            i for i, name in enumerate(residue_names)
+            if name not in polymer_residues
+        ]
+        
+        bonds = []
+        threshold = self.config.bond_distance_threshold
+        
+        for p_idx in polymer_tokens:
+            for l_idx in ligand_tokens:
+                # Check minimum distance between any atoms
+                min_dist = float('inf')
+                
+                for p_coord in atom_coords[p_idx]:
+                    for l_coord in atom_coords[l_idx]:
+                        dist = np.linalg.norm(p_coord - l_coord)
+                        min_dist = min(min_dist, dist)
+                
+                if min_dist < threshold:
+                    bonds.append([p_idx, l_idx])
+        
+        return np.array(bonds, dtype=np.int32) if bonds else np.zeros((0, 2), dtype=np.int32)
+
+
+@dataclass(frozen=True)
+class FeatureEngineeringPipeline:
+    """Complete feature engineering pipeline.
+    
+    Combines all feature extractors for AF3 Table 5 features.
+    
+    Attributes:
+        ref_conformer_extractor: Reference conformer extractor.
+        msa_profile_extractor: MSA profile extractor.
+        template_frame_extractor: Template frame extractor.
+        bond_extractor: Bond feature extractor.
+    """
+    
+    ref_conformer_extractor: ReferenceConformerExtractor = field(
+        default_factory=ReferenceConformerExtractor
+    )
+    msa_profile_extractor: MSAProfileExtractor = field(
+        default_factory=MSAProfileExtractor
+    )
+    template_frame_extractor: TemplateFrameExtractor = field(
+        default_factory=TemplateFrameExtractor
+    )
+    bond_extractor: BondFeatureExtractor = field(
+        default_factory=BondFeatureExtractor
+    )
+    
+    def extract_all_features(
+        self,
+        residue_names: Sequence[str],
+        chain_ids: Sequence[str],
+        residue_indices: Sequence[int],
+        atom_coords: Sequence[np.ndarray],
+        atom_elements: Sequence[Sequence[str]],
+        atom_names: Sequence[Sequence[str]],
+        msa_sequences: Optional[Sequence[str]] = None,
+        msa_deletions: Optional[Sequence[Sequence[int]]] = None,
+        template_coords: Optional[np.ndarray] = None,
+        template_mask: Optional[np.ndarray] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Extract all AF3 Table 5 features.
+        
+        Args:
+            residue_names: Residue name for each token.
+            chain_ids: Chain ID for each token.
+            residue_indices: Residue index for each token.
+            atom_coords: Atom coordinates for each token.
+            atom_elements: Element symbols for each token's atoms.
+            atom_names: Atom names for each token's atoms.
+            msa_sequences: Optional MSA sequences.
+            msa_deletions: Optional MSA deletion counts.
+            template_coords: Optional template backbone coords.
+            template_mask: Optional template validity mask.
+            
+        Returns:
+            Dictionary of all extracted features.
+        """
+        features = {}
+        num_tokens = len(residue_names)
+        
+        # Reference conformer features
+        ref_features = self.ref_conformer_extractor.extract(
+            residue_names,
+            atom_coords,
+            atom_elements,
+            atom_names,
+        )
+        features["ref_pos"] = ref_features.ref_pos
+        features["ref_mask"] = ref_features.ref_mask
+        features["ref_element"] = ref_features.ref_element
+        features["ref_charge"] = ref_features.ref_charge
+        features["ref_atom_name_chars"] = ref_features.ref_atom_name_chars
+        features["ref_space_uid"] = ref_features.ref_space_uid
+        features["atom_to_token"] = ref_features.atom_to_token
+        
+        # MSA profile features
+        if msa_sequences is not None:
+            msa_features = self.msa_profile_extractor.extract_from_sequences(
+                msa_sequences,
+                msa_deletions,
+            )
+            features["msa_profile"] = msa_features.msa_profile
+            features["deletion_mean"] = msa_features.deletion_mean
+            features["has_deletion"] = msa_features.has_deletion
+            features["deletion_value"] = msa_features.deletion_value
+        
+        # Template frame features
+        if template_coords is not None and template_mask is not None:
+            template_features = self.template_frame_extractor.extract(
+                template_coords,
+                template_mask,
+                num_tokens,
+            )
+            features["template_backbone_frame"] = template_features.template_backbone_frame
+            features["template_backbone_frame_mask"] = template_features.template_backbone_frame_mask
+            features["template_distogram"] = template_features.template_distogram
+            if template_features.template_unit_vector is not None:
+                features["template_unit_vector"] = template_features.template_unit_vector
+        
+        # Bond features
+        bond_features = self.bond_extractor.extract(
+            chain_ids,
+            residue_indices,
+            residue_names,
+            atom_coords,
+        )
+        features["token_bonds"] = bond_features.token_bonds
+        if bond_features.bond_types is not None:
+            features["bond_types"] = bond_features.bond_types
+        if bond_features.polymer_ligand_bonds is not None:
+            features["polymer_ligand_bonds"] = bond_features.polymer_ligand_bonds
+        
+        return features
+
+
+def create_feature_pipeline(
+    *,
+    ccd_dir: Optional[Path] = None,
+    include_hydrogens: bool = False,
+    bond_distance_threshold: float = 2.5,
+) -> FeatureEngineeringPipeline:
+    """Factory function to create a configured feature pipeline.
+    
+    Args:
+        ccd_dir: Directory containing CCD conformer files.
+        include_hydrogens: Whether to include hydrogen atoms.
+        bond_distance_threshold: Distance threshold for bond detection.
+        
+    Returns:
+        Configured FeatureEngineeringPipeline instance.
+    """
+    ref_config = ReferenceConformerConfig(
+        ccd_dir=ccd_dir,
+        include_hydrogens=include_hydrogens,
+    )
+    
+    bond_config = BondFeatureConfig(
+        bond_distance_threshold=bond_distance_threshold,
+    )
+    
+    return FeatureEngineeringPipeline(
+        ref_conformer_extractor=ReferenceConformerExtractor(config=ref_config),
+        msa_profile_extractor=MSAProfileExtractor(),
+        template_frame_extractor=TemplateFrameExtractor(),
+        bond_extractor=BondFeatureExtractor(config=bond_config),
+    )
