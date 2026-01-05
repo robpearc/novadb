@@ -22,6 +22,11 @@ from novadb.processing.tokenization.tokenizer import (
     TokenizedStructure,
     Tokenizer,
 )
+from novadb.processing.optimized import (
+    compute_relative_position_vectorized,
+    compute_pair_masks_vectorized,
+    compute_msa_profile_vectorized,
+)
 from novadb.search.msa.msa import MSA
 
 
@@ -948,21 +953,16 @@ class FeatureExtractor:
         - msa_profile: Distribution over residue types (Ntokens, 32)
         - deletion_mean: Mean deletion count per position
         - has_deletion: Binary deletion indicator
+
+        Uses vectorized profile computation for O(n_tokens) instead of
+        O(n_tokens * NUM_RESTYPES * n_seqs).
         """
-        n_seqs, n_tokens = msa_arr.shape
+        # Use vectorized MSA profile computation
+        msa_profile = compute_msa_profile_vectorized(
+            msa_arr, num_classes=self.NUM_RESTYPES
+        )
 
-        # Compute profile (residue type distribution)
-        msa_profile = np.zeros((n_tokens, self.NUM_RESTYPES), dtype=np.float32)
-
-        for j in range(n_tokens):
-            for c in range(self.NUM_RESTYPES):
-                msa_profile[j, c] = np.sum(msa_arr[:, j] == c)
-
-        # Normalize with pseudocount
-        row_sums = msa_profile.sum(axis=1, keepdims=True) + 1e-8
-        msa_profile = msa_profile / row_sums
-
-        # Compute deletion features
+        # Compute deletion features (already vectorized)
         deletion_mean = msa_deletion_value.mean(axis=0).astype(np.float32)
         has_deletion = (msa_deletion_value > 0).any(axis=0).astype(np.float32)
 
@@ -978,31 +978,41 @@ def compute_relative_position_encoding(
     max_relative_idx: int = 32,
 ) -> np.ndarray:
     """Compute relative position encoding.
-    
+
     From AF3: Encodes relative position within chains.
     Clipped to [-max_relative_idx, max_relative_idx].
-    
+
+    Uses vectorized implementation for O(n) instead of O(n²) Python loops.
+
     Args:
         tokens: List of tokens
         max_relative_idx: Maximum relative index before clipping
-        
+
     Returns:
         (Ntokens, Ntokens) array of relative positions
     """
+    if not tokens:
+        return np.zeros((0, 0), dtype=np.int32)
+
     n = len(tokens)
-    rel_pos = np.zeros((n, n), dtype=np.int32)
 
-    for i, tok_i in enumerate(tokens):
-        for j, tok_j in enumerate(tokens):
-            if tok_i.chain_id == tok_j.chain_id:
-                diff = tok_j.residue_index - tok_i.residue_index
-                diff = np.clip(diff, -max_relative_idx, max_relative_idx)
-                rel_pos[i, j] = diff + max_relative_idx
-            else:
-                # Different chains: use special value
-                rel_pos[i, j] = 2 * max_relative_idx + 1
+    # Extract residue indices and chain IDs as arrays
+    residue_indices = np.array([tok.residue_index for tok in tokens], dtype=np.int32)
 
-    return rel_pos
+    # Convert chain_ids to integer indices for vectorized comparison
+    chain_id_map = {}
+    chain_idx = 0
+    chain_ids = np.zeros(n, dtype=np.int32)
+    for i, tok in enumerate(tokens):
+        if tok.chain_id not in chain_id_map:
+            chain_id_map[tok.chain_id] = chain_idx
+            chain_idx += 1
+        chain_ids[i] = chain_id_map[tok.chain_id]
+
+    # Use vectorized computation
+    return compute_relative_position_vectorized(
+        residue_indices, chain_ids, max_relative_idx
+    )
 
 
 def compute_token_pair_features(
@@ -1010,27 +1020,54 @@ def compute_token_pair_features(
     max_relative_idx: int = 32,
 ) -> Dict[str, np.ndarray]:
     """Compute pairwise token features.
-    
+
+    Uses vectorized implementations for O(n) array construction instead of
+    O(n²) nested Python loops.
+
     Returns:
         Dictionary with:
         - relative_position: (N, N) relative sequence positions
         - same_chain: (N, N) mask for same chain
         - same_entity: (N, N) mask for same entity
     """
+    if not tokens:
+        return {
+            "relative_position": np.zeros((0, 0), dtype=np.int32),
+            "same_chain": np.zeros((0, 0), dtype=np.float32),
+            "same_entity": np.zeros((0, 0), dtype=np.float32),
+        }
+
     n = len(tokens)
 
-    relative_position = compute_relative_position_encoding(
-        tokens, max_relative_idx
-    )
-    same_chain = np.zeros((n, n), dtype=np.float32)
-    same_entity = np.zeros((n, n), dtype=np.float32)
+    # Extract chain and entity IDs as integer arrays for vectorized comparison
+    chain_id_map = {}
+    entity_id_map = {}
+    chain_idx = 0
+    entity_idx = 0
+    chain_ids = np.zeros(n, dtype=np.int32)
+    entity_ids = np.zeros(n, dtype=np.int32)
+    residue_indices = np.zeros(n, dtype=np.int32)
 
-    for i, tok_i in enumerate(tokens):
-        for j, tok_j in enumerate(tokens):
-            if tok_i.chain_id == tok_j.chain_id:
-                same_chain[i, j] = 1.0
-            if tok_i.entity_id == tok_j.entity_id:
-                same_entity[i, j] = 1.0
+    for i, tok in enumerate(tokens):
+        # Map chain IDs to integers
+        if tok.chain_id not in chain_id_map:
+            chain_id_map[tok.chain_id] = chain_idx
+            chain_idx += 1
+        chain_ids[i] = chain_id_map[tok.chain_id]
+
+        # Map entity IDs to integers
+        if tok.entity_id not in entity_id_map:
+            entity_id_map[tok.entity_id] = entity_idx
+            entity_idx += 1
+        entity_ids[i] = entity_id_map[tok.entity_id]
+
+        residue_indices[i] = tok.residue_index
+
+    # Use vectorized computations
+    relative_position = compute_relative_position_vectorized(
+        residue_indices, chain_ids, max_relative_idx
+    )
+    same_chain, same_entity = compute_pair_masks_vectorized(chain_ids, entity_ids)
 
     return {
         "relative_position": relative_position,

@@ -7,6 +7,11 @@ Implements additional features from AF3 Supplement Table 5:
 - Bond features (token_bonds, polymer-ligand bonds)
 - Atom-to-token mapping with proper handling
 
+Performance optimizations:
+- Vectorized distogram computation using np.digitize
+- Vectorized unit vector computation
+- Optimized pair feature computation
+
 Reference: AF3 Supplement Section 2.8 and Table 5
 """
 
@@ -19,6 +24,13 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
+
+from novadb.processing.optimized import (
+    compute_distogram_fast,
+    compute_unit_vectors_vectorized,
+    compute_relative_position_vectorized,
+    compute_pair_masks_vectorized,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -643,44 +655,39 @@ class TemplateFrameExtractor:
         num_tokens: int,
     ) -> np.ndarray:
         """Compute pairwise distance histogram.
-        
+
+        Uses vectorized np.digitize for O(n²) instead of O(n² * bins).
+
         Args:
             positions: Representative positions (Ntemplate, Ntokens, 3).
             mask: Validity mask (Ntemplate, Ntokens).
             num_tokens: Number of tokens.
-            
+
         Returns:
             Distogram (Ntemplate, Ntokens, Ntokens, Nbins).
         """
         n_templates = positions.shape[0]
         n_bins = self.num_distance_bins
-        
-        distogram = np.zeros(
-            (n_templates, num_tokens, num_tokens, n_bins),
-            dtype=np.float32,
+        n_pos = min(num_tokens, positions.shape[1])
+
+        # Use optimized vectorized distogram computation
+        distogram = compute_distogram_fast(
+            positions[:, :n_pos, :],
+            mask[:, :n_pos],
+            num_bins=n_bins,
+            min_dist=self.distance_min,
+            max_dist=self.distance_max,
         )
-        
-        bin_edges = np.linspace(
-            self.distance_min,
-            self.distance_max,
-            n_bins + 1,
-        )
-        
-        for t in range(n_templates):
-            n_pos = min(num_tokens, positions.shape[1])
-            
-            # Compute pairwise distances
-            diff = positions[t, :n_pos, None, :] - positions[t, None, :n_pos, :]
-            distances = np.sqrt(np.sum(diff ** 2, axis=-1))
-            
-            # Create pair mask
-            pair_mask = mask[t, :n_pos, None] * mask[t, None, :n_pos]
-            
-            # Bin distances
-            for b in range(n_bins):
-                in_bin = (distances >= bin_edges[b]) & (distances < bin_edges[b + 1])
-                distogram[t, :n_pos, :n_pos, b] = in_bin * pair_mask
-        
+
+        # Pad to num_tokens if needed
+        if n_pos < num_tokens:
+            padded = np.zeros(
+                (n_templates, num_tokens, num_tokens, n_bins),
+                dtype=np.float32,
+            )
+            padded[:, :n_pos, :n_pos, :] = distogram
+            distogram = padded
+
         return distogram
     
     def _compute_unit_vectors(
@@ -690,37 +697,36 @@ class TemplateFrameExtractor:
         num_tokens: int,
     ) -> np.ndarray:
         """Compute unit vectors between residue pairs.
-        
+
+        Uses fully vectorized computation for all templates.
+
         Args:
             positions: Representative positions (Ntemplate, Ntokens, 3).
             mask: Validity mask (Ntemplate, Ntokens).
             num_tokens: Number of tokens.
-            
+
         Returns:
             Unit vectors (Ntemplate, Ntokens, Ntokens, 3).
         """
         n_templates = positions.shape[0]
-        
-        unit_vector = np.zeros(
-            (n_templates, num_tokens, num_tokens, 3),
-            dtype=np.float32,
+        n_pos = min(num_tokens, positions.shape[1])
+
+        # Use optimized vectorized unit vector computation
+        unit_vectors = compute_unit_vectors_vectorized(
+            positions[:, :n_pos, :],
+            mask[:, :n_pos],
         )
-        
-        for t in range(n_templates):
-            n_pos = min(num_tokens, positions.shape[1])
-            
-            # Compute direction vectors
-            diff = positions[t, :n_pos, None, :] - positions[t, None, :n_pos, :]
-            distances = np.sqrt(np.sum(diff ** 2, axis=-1, keepdims=True))
-            distances = np.maximum(distances, 1e-8)  # Avoid division by zero
-            
-            unit_vec = diff / distances
-            
-            # Apply mask
-            pair_mask = mask[t, :n_pos, None] * mask[t, None, :n_pos]
-            unit_vector[t, :n_pos, :n_pos] = unit_vec * pair_mask[:, :, None]
-        
-        return unit_vector
+
+        # Pad to num_tokens if needed
+        if n_pos < num_tokens:
+            padded = np.zeros(
+                (n_templates, num_tokens, num_tokens, 3),
+                dtype=np.float32,
+            )
+            padded[:, :n_pos, :n_pos, :] = unit_vectors
+            unit_vectors = padded
+
+        return unit_vectors
 
 
 @dataclass

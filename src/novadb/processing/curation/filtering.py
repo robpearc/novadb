@@ -8,6 +8,10 @@ Implements data filtering from AlphaFold3 Section 2.5:
 - Max 20 chains cropping for large bioassemblies (Section 2.5.4)
 - Clash detection (>30% atoms within 1.7Å)
 - Consecutive Cα distance filtering (>10Å indicates break)
+
+Performance optimizations:
+- Uses KD-tree for O(n log n) clash detection instead of O(n²)
+- Vectorized chain contact detection
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ from novadb.data.parsers.structure import (
     ION_CCD_CODES,
 )
 from novadb.config import FilteringConfig, DateConfig
+from novadb.processing.optimized import (
+    detect_clashing_chains_fast,
+    compute_interface_contacts_fast,
+)
 
 # AF3 Section 2.5.4 constants
 MAX_CHAINS_AFTER_CROPPING = 20
@@ -336,27 +344,24 @@ class StructureFilter:
         structure: Structure,
         threshold: float = 5.0,
     ) -> Set[Tuple[str, str]]:
-        """Get set of chain pairs that have contacts within threshold."""
-        contacts = set()
+        """Get set of chain pairs that have contacts within threshold.
+
+        Uses optimized KD-tree based contact detection.
+        """
         chain_ids = list(structure.chains.keys())
 
-        for i, cid1 in enumerate(chain_ids):
-            chain1 = structure.chains[cid1]
-            coords1 = chain1.get_all_heavy_atom_coords()
-            if len(coords1) == 0:
-                continue
+        # Collect coordinates for all chains
+        chain_coords = {}
+        for chain_id in chain_ids:
+            chain = structure.chains[chain_id]
+            coords = chain.get_all_heavy_atom_coords()
+            chain_coords[chain_id] = coords if len(coords) > 0 else np.zeros((0, 3))
 
-            for cid2 in chain_ids[i + 1:]:
-                chain2 = structure.chains[cid2]
-                coords2 = chain2.get_all_heavy_atom_coords()
-                if len(coords2) == 0:
-                    continue
+        # Use optimized interface contact detection
+        interface_contacts = compute_interface_contacts_fast(chain_coords, threshold)
 
-                # Check if any atoms are within threshold
-                diffs = coords1[:, np.newaxis, :] - coords2[np.newaxis, :, :]
-                distances = np.sqrt(np.sum(diffs ** 2, axis=-1))
-                if np.min(distances) < threshold:
-                    contacts.add((cid1, cid2))
+        # Convert to set of chain pairs
+        contacts = set(interface_contacts.keys())
 
         return contacts
 
@@ -371,6 +376,8 @@ class StructureFilter:
         From AF3 Section 2.5.4: Remove chains where >30% of atoms are
         within 1.7Å of atoms from other chains.
 
+        Uses KD-tree for O(n log n) clash detection instead of O(n²).
+
         Args:
             structure: Structure to filter
             distance_threshold: Distance for clash detection (1.7Å)
@@ -379,41 +386,23 @@ class StructureFilter:
         Returns:
             New structure with clashing chains removed
         """
-        chains_to_keep = []
         chain_ids = list(structure.chains.keys())
 
+        # Collect coordinates for all chains
+        chain_coords = {}
         for chain_id in chain_ids:
             chain = structure.chains[chain_id]
             coords = chain.get_all_heavy_atom_coords()
-            if len(coords) == 0:
-                chains_to_keep.append(chain_id)
-                continue
+            chain_coords[chain_id] = coords if len(coords) > 0 else np.zeros((0, 3))
 
-            # Get all other atoms
-            other_coords = []
-            for other_id in chain_ids:
-                if other_id != chain_id:
-                    other_chain = structure.chains[other_id]
-                    other_coords.append(other_chain.get_all_heavy_atom_coords())
+        # Use optimized KD-tree based clash detection
+        chains_to_remove = detect_clashing_chains_fast(
+            chain_coords,
+            distance_threshold=distance_threshold,
+            fraction_threshold=fraction_threshold,
+        )
 
-            if not other_coords:
-                chains_to_keep.append(chain_id)
-                continue
-
-            all_other_coords = np.concatenate([c for c in other_coords if len(c) > 0])
-            if len(all_other_coords) == 0:
-                chains_to_keep.append(chain_id)
-                continue
-
-            # Count clashing atoms
-            diffs = coords[:, np.newaxis, :] - all_other_coords[np.newaxis, :, :]
-            distances = np.sqrt(np.sum(diffs ** 2, axis=-1))
-            min_distances = np.min(distances, axis=1)
-            clash_count = np.sum(min_distances < distance_threshold)
-            clash_fraction = clash_count / len(coords)
-
-            if clash_fraction < fraction_threshold:
-                chains_to_keep.append(chain_id)
+        chains_to_keep = [cid for cid in chain_ids if cid not in chains_to_remove]
 
         # Build new structure
         new_chains = {cid: structure.chains[cid] for cid in chains_to_keep}

@@ -4,6 +4,10 @@ Implements interface clustering from AlphaFold3 Section 2.5:
 - Cluster structures by interface composition
 - Identify protein-protein, protein-ligand, protein-nucleic interfaces
 - Group similar interfaces for balanced sampling
+
+Performance optimizations:
+- Uses KD-tree for O(n log n) contact detection
+- Vectorized distance computations
 """
 
 from __future__ import annotations
@@ -16,6 +20,10 @@ from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 import numpy as np
 
 from novadb.data.parsers.structure import Structure, Chain, ChainType
+from novadb.processing.optimized import (
+    detect_contacts_kdtree,
+    compute_pairwise_distances_fast,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,38 +157,72 @@ class InterfaceDetector:
         chain_id_2: str,
         chain2: Chain,
     ) -> Optional[Interface]:
-        """Detect interface between two chains."""
-        contact_residues_1 = []
-        contact_residues_2 = []
-        contact_pairs = []
-        min_dist = float('inf')
-        
-        for i, res1 in enumerate(chain1.residues):
-            coords1 = res1.heavy_atom_coords
-            if len(coords1) == 0:
-                continue
-            
-            for j, res2 in enumerate(chain2.residues):
-                coords2 = res2.heavy_atom_coords
-                if len(coords2) == 0:
-                    continue
-                
-                # Compute minimum distance
-                dist_matrix = np.linalg.norm(
-                    coords1[:, None, :] - coords2[None, :, :],
-                    axis=-1
-                )
-                dist = dist_matrix.min()
-                
-                if dist < self.contact_distance:
-                    contact_residues_1.append(i)
-                    contact_residues_2.append(j)
-                    contact_pairs.append((i, j))
-                    min_dist = min(min_dist, dist)
-        
+        """Detect interface between two chains.
+
+        Uses optimized KD-tree based contact detection.
+        """
+        # Collect all heavy atom coordinates with residue mapping
+        coords1_list = []
+        residue_map1 = []  # Maps atom index to residue index
+        for i, res in enumerate(chain1.residues):
+            res_coords = res.heavy_atom_coords
+            if len(res_coords) > 0:
+                coords1_list.append(res_coords)
+                residue_map1.extend([i] * len(res_coords))
+
+        coords2_list = []
+        residue_map2 = []
+        for j, res in enumerate(chain2.residues):
+            res_coords = res.heavy_atom_coords
+            if len(res_coords) > 0:
+                coords2_list.append(res_coords)
+                residue_map2.extend([j] * len(res_coords))
+
+        if not coords1_list or not coords2_list:
+            return None
+
+        coords1 = np.concatenate(coords1_list)
+        coords2 = np.concatenate(coords2_list)
+        residue_map1 = np.array(residue_map1)
+        residue_map2 = np.array(residue_map2)
+
+        # Use optimized KD-tree based contact detection
+        contact_atom_idx1, contact_atom_idx2, min_dist = detect_contacts_kdtree(
+            coords1, coords2, self.contact_distance
+        )
+
+        if not contact_atom_idx1:
+            return None
+
+        # Map atom contacts back to residue contacts
+        contact_residues_1_set = set()
+        contact_residues_2_set = set()
+        contact_pairs_set = set()
+
+        for atom_i in contact_atom_idx1:
+            res_i = int(residue_map1[atom_i])
+            contact_residues_1_set.add(res_i)
+
+        for atom_j in contact_atom_idx2:
+            res_j = int(residue_map2[atom_j])
+            contact_residues_2_set.add(res_j)
+
+        # Build contact pairs by checking which residue pairs have contacts
+        for atom_i in contact_atom_idx1:
+            res_i = int(residue_map1[atom_i])
+            for atom_j in contact_atom_idx2:
+                res_j = int(residue_map2[atom_j])
+                # Check if this atom pair is actually in contact
+                if np.linalg.norm(coords1[atom_i] - coords2[atom_j]) < self.contact_distance:
+                    contact_pairs_set.add((res_i, res_j))
+
+        contact_residues_1 = list(contact_residues_1_set)
+        contact_residues_2 = list(contact_residues_2_set)
+        contact_pairs = list(contact_pairs_set)
+
         if len(contact_pairs) < self.min_contacts:
             return None
-        
+
         return Interface(
             chain_id_1=chain_id_1,
             chain_id_2=chain_id_2,

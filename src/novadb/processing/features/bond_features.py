@@ -11,6 +11,10 @@ From AF3 Table 5:
 "token_bonds: A 2D matrix indicating if there is a bond between any atom
 in token i and token j, restricted to just polymer-ligand and ligand-ligand
 bonds and bonds less than 2.4 Å during training."
+
+Performance optimizations:
+- Uses KD-tree for O(n log n) cross-chain bond detection instead of O(n⁴)
+- Vectorized intra-residue bond detection
 """
 
 from __future__ import annotations
@@ -21,6 +25,11 @@ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 import numpy as np
 
 from novadb.data.parsers.structure import Structure, Chain, Residue, Atom, ChainType
+from novadb.processing.optimized import (
+    detect_cross_chain_bonds_fast,
+    find_all_pairs_within_distance_symmetric,
+    BondCandidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,25 +216,34 @@ class BondDetector:
         residue_idx: int,
         residue: Residue,
     ) -> List[Bond]:
-        """Detect bonds within a residue (for ligands)."""
+        """Detect bonds within a residue (for ligands).
+
+        Uses vectorized distance computation for better performance.
+        """
         bonds = []
         atoms = list(residue.atoms.values())
-        
-        for i, atom1 in enumerate(atoms):
-            for atom2 in atoms[i + 1:]:
-                dist = np.linalg.norm(atom1.coords - atom2.coords)
-                
-                if dist <= self.covalent_threshold:
-                    bonds.append(Bond(
-                        atom1_chain=chain_id,
-                        atom1_residue_idx=residue_idx,
-                        atom1_name=atom1.name,
-                        atom2_chain=chain_id,
-                        atom2_residue_idx=residue_idx,
-                        atom2_name=atom2.name,
-                        distance=float(dist),
-                    ))
-        
+
+        if len(atoms) < 2:
+            return bonds
+
+        # Collect coordinates and names
+        coords = np.array([atom.coords for atom in atoms], dtype=np.float32)
+        names = [atom.name for atom in atoms]
+
+        # Use optimized symmetric pair finding
+        pairs = find_all_pairs_within_distance_symmetric(coords, self.covalent_threshold)
+
+        for i, j, dist in pairs:
+            bonds.append(Bond(
+                atom1_chain=chain_id,
+                atom1_residue_idx=residue_idx,
+                atom1_name=names[i],
+                atom2_chain=chain_id,
+                atom2_residue_idx=residue_idx,
+                atom2_name=names[j],
+                distance=dist,
+            ))
+
         return bonds
     
     def _detect_backbone_bond(
@@ -275,37 +293,62 @@ class BondDetector:
         chain_id_2: str,
         chain2: Chain,
     ) -> List[Bond]:
-        """Detect bonds between two chains."""
+        """Detect bonds between two chains.
+
+        Uses KD-tree for O(n log m) complexity instead of O(n*m).
+        """
         bonds = []
-        
+
         is_polymer_1 = chain1.chain_type in {ChainType.PROTEIN, ChainType.RNA, ChainType.DNA}
         is_polymer_2 = chain2.chain_type in {ChainType.PROTEIN, ChainType.RNA, ChainType.DNA}
-        
+
         # AF3 focuses on polymer-ligand and ligand-ligand bonds
         if is_polymer_1 and is_polymer_2:
             # Skip polymer-polymer (disulfides handled separately if needed)
             return bonds
-        
-        # Check all atom pairs between chains
-        for i, res1 in enumerate(chain1.residues):
-            for j, res2 in enumerate(chain2.residues):
-                for atom1 in res1.atoms.values():
-                    for atom2 in res2.atoms.values():
-                        dist = np.linalg.norm(atom1.coords - atom2.coords)
-                        
-                        if dist <= self.covalent_threshold:
-                            is_ligand = not is_polymer_1 or not is_polymer_2
-                            bonds.append(Bond(
-                                atom1_chain=chain_id_1,
-                                atom1_residue_idx=i,
-                                atom1_name=atom1.name,
-                                atom2_chain=chain_id_2,
-                                atom2_residue_idx=j,
-                                atom2_name=atom2.name,
-                                is_ligand_bond=is_ligand,
-                                distance=float(dist),
-                            ))
-        
+
+        # Collect all atom coordinates and info for each chain
+        coords1 = []
+        info1 = []  # (residue_idx, atom_name)
+        for i, res in enumerate(chain1.residues):
+            for atom in res.atoms.values():
+                coords1.append(atom.coords)
+                info1.append((i, atom.name))
+
+        coords2 = []
+        info2 = []
+        for j, res in enumerate(chain2.residues):
+            for atom in res.atoms.values():
+                coords2.append(atom.coords)
+                info2.append((j, atom.name))
+
+        if not coords1 or not coords2:
+            return bonds
+
+        coords1 = np.array(coords1, dtype=np.float32)
+        coords2 = np.array(coords2, dtype=np.float32)
+
+        # Use optimized KD-tree based detection
+        bond_candidates = detect_cross_chain_bonds_fast(
+            coords1, coords2, info1, info2,
+            chain_id_1, chain_id_2,
+            threshold=self.covalent_threshold,
+        )
+
+        is_ligand = not is_polymer_1 or not is_polymer_2
+
+        for bc in bond_candidates:
+            bonds.append(Bond(
+                atom1_chain=chain_id_1,
+                atom1_residue_idx=bc.residue1_idx,
+                atom1_name=bc.atom1_name,
+                atom2_chain=chain_id_2,
+                atom2_residue_idx=bc.residue2_idx,
+                atom2_name=bc.atom2_name,
+                is_ligand_bond=is_ligand,
+                distance=bc.distance,
+            ))
+
         return bonds
 
 
