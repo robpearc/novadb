@@ -674,6 +674,983 @@ class BackboneCompleteTransform(BaseTransform):
 
 
 # =============================================================================
+# Frame Construction Transforms (AF3 Section 4.3.2)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class FrameConfig:
+    """Configuration for frame construction.
+
+    From AF3 Section 4.3.2: Frames are constructed from three atoms.
+
+    Attributes:
+        colinearity_threshold_low: Minimum angle (degrees) before frame invalid.
+        colinearity_threshold_high: Maximum angle (degrees) before frame invalid.
+        use_kdtree: Whether to use KDTree for ligand frame construction.
+    """
+
+    colinearity_threshold_low: float = 25.0
+    colinearity_threshold_high: float = 155.0
+    use_kdtree: bool = True
+
+
+class TokenFrameTransform(BaseTransform):
+    """Construct local coordinate frames for each token.
+
+    From AF3 Section 4.3.2:
+    - Protein tokens use backbone atoms [N, CA, C]
+    - DNA/RNA tokens use sugar atoms [C1', C3', C4']
+    - Ligand tokens use center atom + two nearest neighbors from reference conformer
+
+    The frame is invalid if:
+    - Required atoms are missing
+    - Three atoms are colinear (angle < 25 or > 155 degrees)
+    - Fewer than 3 atoms exist in the residue
+
+    Input keys:
+        - atoms: List[Dict[str, AtomData]] per token
+        - token_types: List[str] of token types
+        - atom_ref_pos: np.ndarray (Natoms, 3) reference positions
+        - atom_ref_mask: np.ndarray (Natoms,) reference mask
+        - atom_to_token: np.ndarray (Natoms,) atom to token mapping
+
+    Output keys:
+        - has_frame: np.ndarray (Ntokens,) int32, 1 if valid frame
+        - frame_atom_index: np.ndarray (Ntokens, 3) int32, indices of [a, b, c] atoms
+    """
+
+    # Backbone atoms for frame construction
+    PROTEIN_FRAME_ATOMS = ["N", "CA", "C"]
+    NUCLEIC_FRAME_ATOMS = ["C1'", "C3'", "C4'"]
+
+    def __init__(
+        self,
+        config: Optional[FeatureConfig] = None,
+        frame_config: Optional[FrameConfig] = None,
+    ):
+        super().__init__(config)
+        self.frame_config = frame_config or FrameConfig()
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atoms_per_token = data.get("atoms", [])
+        token_types = data.get("token_types", [])
+        atom_ref_pos = data.get("atom_ref_pos", np.zeros((0, 3)))
+        atom_ref_mask = data.get("atom_ref_mask", np.array([]))
+        atom_to_token = data.get("atom_to_token", np.array([]))
+
+        n_tokens = len(atoms_per_token)
+
+        has_frame = np.zeros(n_tokens, dtype=np.int32)
+        frame_atom_index = np.full((n_tokens, 3), -1, dtype=np.int32)
+
+        if n_tokens == 0:
+            data["has_frame"] = has_frame
+            data["frame_atom_index"] = frame_atom_index
+            return data
+
+        # Build atom name to global index mapping per token
+        token_atom_maps = self._build_token_atom_maps(atoms_per_token, atom_to_token)
+
+        # Build KDTree for ligand frame construction if needed
+        ligand_kdtrees = {}
+        if self.frame_config.use_kdtree:
+            ligand_kdtrees = self._build_ligand_kdtrees(
+                atoms_per_token, token_types, atom_ref_pos, atom_ref_mask, atom_to_token
+            )
+
+        for i, (atoms, ttype) in enumerate(zip(atoms_per_token, token_types)):
+            if not isinstance(atoms, dict) or len(atoms) == 0:
+                continue
+
+            atom_map = token_atom_maps[i]
+
+            if ttype == "protein":
+                valid, indices = self._get_polymer_frame(
+                    atoms, atom_map, self.PROTEIN_FRAME_ATOMS
+                )
+            elif ttype in ("rna", "dna"):
+                valid, indices = self._get_polymer_frame(
+                    atoms, atom_map, self.NUCLEIC_FRAME_ATOMS
+                )
+            else:
+                # Ligand frame
+                valid, indices = self._get_ligand_frame(
+                    i, atoms, atom_map, atom_ref_pos, atom_ref_mask,
+                    ligand_kdtrees.get(i)
+                )
+
+            if valid:
+                # Colinearity check
+                if self._check_colinearity(atom_ref_pos, indices):
+                    has_frame[i] = 1
+                    frame_atom_index[i] = indices
+
+        data["has_frame"] = has_frame
+        data["frame_atom_index"] = frame_atom_index
+        return data
+
+    def _build_token_atom_maps(
+        self,
+        atoms_per_token: List[Dict],
+        atom_to_token: np.ndarray,
+    ) -> List[Dict[str, int]]:
+        """Build mapping from atom name to global index for each token."""
+        n_tokens = len(atoms_per_token)
+        token_atom_maps = [{} for _ in range(n_tokens)]
+
+        # Build reverse mapping from global index to token
+        if len(atom_to_token) > 0:
+            global_idx = 0
+            for token_idx, atoms in enumerate(atoms_per_token):
+                if isinstance(atoms, dict):
+                    for atom_name in atoms.keys():
+                        token_atom_maps[token_idx][atom_name] = global_idx
+                        global_idx += 1
+
+        return token_atom_maps
+
+    def _build_ligand_kdtrees(
+        self,
+        atoms_per_token: List[Dict],
+        token_types: List[str],
+        atom_ref_pos: np.ndarray,
+        atom_ref_mask: np.ndarray,
+        atom_to_token: np.ndarray,
+    ) -> Dict[int, Tuple[Any, List[int]]]:
+        """Build KDTrees for ligand tokens for nearest neighbor queries."""
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            return {}
+
+        ligand_kdtrees = {}
+
+        for token_idx, (atoms, ttype) in enumerate(zip(atoms_per_token, token_types)):
+            if ttype not in ("ligand", "other") or not isinstance(atoms, dict):
+                continue
+
+            # Get atom indices for this token
+            atom_indices = np.where(atom_to_token == token_idx)[0]
+
+            if len(atom_indices) < 3:
+                ligand_kdtrees[token_idx] = (None, list(atom_indices))
+                continue
+
+            # Get valid positions
+            valid_mask = atom_ref_mask[atom_indices] > 0
+            valid_indices = atom_indices[valid_mask]
+
+            if len(valid_indices) < 3:
+                ligand_kdtrees[token_idx] = (None, list(atom_indices))
+                continue
+
+            positions = atom_ref_pos[valid_indices]
+            kdtree = cKDTree(positions)
+            ligand_kdtrees[token_idx] = (kdtree, list(valid_indices))
+
+        return ligand_kdtrees
+
+    def _get_polymer_frame(
+        self,
+        atoms: Dict,
+        atom_map: Dict[str, int],
+        frame_atoms: List[str],
+    ) -> Tuple[bool, np.ndarray]:
+        """Get frame for protein/nucleic acid tokens."""
+        indices = np.array([-1, -1, -1], dtype=np.int32)
+
+        # Check all required atoms exist
+        for atom_name in frame_atoms:
+            if atom_name not in atoms or atom_name not in atom_map:
+                return False, indices
+
+        # Get indices in order [a, b, c]
+        for i, atom_name in enumerate(frame_atoms):
+            indices[i] = atom_map[atom_name]
+
+        return True, indices
+
+    def _get_ligand_frame(
+        self,
+        token_idx: int,
+        atoms: Dict,
+        atom_map: Dict[str, int],
+        atom_ref_pos: np.ndarray,
+        atom_ref_mask: np.ndarray,
+        kdtree_data: Optional[Tuple],
+    ) -> Tuple[bool, np.ndarray]:
+        """Get frame for ligand tokens using nearest neighbors.
+
+        From AF3 Section 4.3.2:
+        - b is the center atom (first atom in token)
+        - a is the closest atom to b
+        - c is the second closest atom to b
+        """
+        indices = np.array([-1, -1, -1], dtype=np.int32)
+
+        if len(atoms) < 3:
+            return False, indices
+
+        # Get center atom (first atom in token)
+        atom_names = list(atoms.keys())
+        center_atom_name = atom_names[0]
+
+        if center_atom_name not in atom_map:
+            return False, indices
+
+        b_idx = atom_map[center_atom_name]
+        indices[1] = b_idx  # b is center
+
+        if kdtree_data is None:
+            return False, indices
+
+        kdtree, valid_indices = kdtree_data
+
+        if kdtree is None or len(valid_indices) < 3:
+            return False, indices
+
+        # Query nearest neighbors (k=3 to get self + 2 neighbors)
+        center_pos = atom_ref_pos[b_idx:b_idx+1]
+        distances, neighbor_indices = kdtree.query(center_pos, k=3)
+
+        # Map back to global indices
+        neighbor_global = [valid_indices[i] for i in neighbor_indices[0]]
+
+        # a is closest (excluding self), c is second closest
+        neighbors_excluding_self = [
+            idx for idx in neighbor_global if idx != b_idx
+        ]
+
+        if len(neighbors_excluding_self) < 2:
+            return False, indices
+
+        indices[0] = neighbors_excluding_self[0]  # a
+        indices[2] = neighbors_excluding_self[1]  # c
+
+        # Verify all positions are valid
+        if not all(atom_ref_mask[idx] > 0 for idx in indices if idx >= 0):
+            return False, indices
+
+        return True, indices
+
+    def _check_colinearity(
+        self,
+        positions: np.ndarray,
+        indices: np.ndarray,
+    ) -> bool:
+        """Check if three atoms are not colinear.
+
+        Returns True if the angle is within valid range (not colinear).
+        """
+        if np.any(indices < 0) or np.any(indices >= len(positions)):
+            return False
+
+        a_pos = positions[indices[0]]
+        b_pos = positions[indices[1]]
+        c_pos = positions[indices[2]]
+
+        # Compute angle at b
+        vec_ba = a_pos - b_pos
+        vec_bc = c_pos - b_pos
+
+        norm_ba = np.linalg.norm(vec_ba)
+        norm_bc = np.linalg.norm(vec_bc)
+
+        if norm_ba < 1e-8 or norm_bc < 1e-8:
+            return False
+
+        cos_angle = np.dot(vec_ba, vec_bc) / (norm_ba * norm_bc)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle_degrees = np.degrees(np.arccos(cos_angle))
+
+        # Check if NOT colinear
+        return (
+            angle_degrees > self.frame_config.colinearity_threshold_low
+            and angle_degrees < self.frame_config.colinearity_threshold_high
+        )
+
+
+class FrameFromPositionsTransform(BaseTransform):
+    """Compute 4x4 transformation matrices from frame atoms.
+
+    Given frame atom indices [a, b, c], construct the local coordinate frame:
+    - Origin at b (center atom)
+    - X-axis: b -> c direction
+    - Y-axis: perpendicular to X in the a-b-c plane
+    - Z-axis: cross product of X and Y
+
+    Input keys:
+        - atom_ref_pos: np.ndarray (Natoms, 3)
+        - has_frame: np.ndarray (Ntokens,)
+        - frame_atom_index: np.ndarray (Ntokens, 3)
+
+    Output keys:
+        - backbone_rigid_tensor: np.ndarray (Ntokens, 4, 4) transformation matrices
+        - backbone_rigid_mask: np.ndarray (Ntokens,) validity mask
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atom_ref_pos = data.get("atom_ref_pos", np.zeros((0, 3)))
+        has_frame = data.get("has_frame", np.array([]))
+        frame_atom_index = data.get("frame_atom_index", np.zeros((0, 3), dtype=np.int32))
+
+        n_tokens = len(has_frame) if len(has_frame) > 0 else 0
+
+        backbone_rigid_tensor = np.zeros((n_tokens, 4, 4), dtype=np.float32)
+        backbone_rigid_mask = np.zeros(n_tokens, dtype=np.float32)
+
+        # Initialize with identity matrices
+        for i in range(n_tokens):
+            backbone_rigid_tensor[i] = np.eye(4, dtype=np.float32)
+
+        for i in range(n_tokens):
+            if has_frame[i] == 0:
+                continue
+
+            a_idx, b_idx, c_idx = frame_atom_index[i]
+
+            if a_idx < 0 or b_idx < 0 or c_idx < 0:
+                continue
+
+            a_pos = atom_ref_pos[a_idx]
+            b_pos = atom_ref_pos[b_idx]  # Origin
+            c_pos = atom_ref_pos[c_idx]
+
+            # X-axis: b -> c
+            x_axis = c_pos - b_pos
+            x_norm = np.linalg.norm(x_axis)
+            if x_norm < 1e-6:
+                continue
+            x_axis = x_axis / x_norm
+
+            # Y-axis: perpendicular in a-b-c plane
+            a_to_b = b_pos - a_pos
+            y_axis = a_to_b - np.dot(a_to_b, x_axis) * x_axis
+            y_norm = np.linalg.norm(y_axis)
+            if y_norm < 1e-6:
+                continue
+            y_axis = y_axis / y_norm
+
+            # Z-axis: cross product (right-handed)
+            z_axis = np.cross(x_axis, y_axis)
+
+            # Build 4x4 transformation matrix
+            backbone_rigid_tensor[i, :3, 0] = x_axis
+            backbone_rigid_tensor[i, :3, 1] = y_axis
+            backbone_rigid_tensor[i, :3, 2] = z_axis
+            backbone_rigid_tensor[i, :3, 3] = b_pos  # Translation
+            backbone_rigid_tensor[i, 3, 3] = 1.0
+
+            backbone_rigid_mask[i] = 1.0
+
+        data["backbone_rigid_tensor"] = backbone_rigid_tensor
+        data["backbone_rigid_mask"] = backbone_rigid_mask
+        return data
+
+
+# =============================================================================
+# Reference Conformer Augmentation Transforms
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class AugmentConfig:
+    """Configuration for reference conformer augmentation.
+
+    Attributes:
+        apply_rotation: Whether to apply random rotation.
+        apply_translation: Whether to apply random translation.
+        translation_std: Standard deviation for translation noise.
+        centralize: Whether to center positions at origin.
+    """
+
+    apply_rotation: bool = True
+    apply_translation: bool = True
+    translation_std: float = 1.0
+    centralize: bool = True
+
+
+class RefPosAugmentTransform(BaseTransform):
+    """Apply random augmentation to reference conformer positions.
+
+    From AF3: Reference positions are augmented with random rotation
+    and translation to prevent overfitting to specific orientations.
+
+    Each residue (ref_space_uid) is augmented independently.
+
+    Input keys:
+        - atom_ref_pos: np.ndarray (Natoms, 3)
+        - atom_ref_space_uid: np.ndarray (Natoms,)
+
+    Output keys:
+        - atom_ref_pos: np.ndarray (Natoms, 3) augmented positions
+    """
+
+    def __init__(
+        self,
+        config: Optional[FeatureConfig] = None,
+        augment_config: Optional[AugmentConfig] = None,
+    ):
+        super().__init__(config)
+        self.augment_config = augment_config or AugmentConfig()
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atom_ref_pos = data.get("atom_ref_pos", np.zeros((0, 3)))
+        atom_ref_space_uid = data.get("atom_ref_space_uid", np.array([]))
+
+        if len(atom_ref_pos) == 0:
+            return data
+
+        augmented_pos = atom_ref_pos.copy()
+
+        # Process each residue independently
+        unique_uids = np.unique(atom_ref_space_uid)
+
+        for uid in unique_uids:
+            mask = atom_ref_space_uid == uid
+            residue_pos = augmented_pos[mask]
+
+            # Centralize
+            if self.augment_config.centralize:
+                center = residue_pos.mean(axis=0)
+                residue_pos = residue_pos - center
+
+            # Random rotation
+            if self.augment_config.apply_rotation:
+                rotation = self._random_rotation_matrix()
+                residue_pos = residue_pos @ rotation.T
+
+            # Random translation
+            if self.augment_config.apply_translation:
+                translation = np.random.randn(3) * self.augment_config.translation_std
+                residue_pos = residue_pos + translation
+
+            augmented_pos[mask] = residue_pos
+
+        data["atom_ref_pos"] = augmented_pos
+        return data
+
+    def _random_rotation_matrix(self) -> np.ndarray:
+        """Generate a random 3x3 rotation matrix using QR decomposition."""
+        random_matrix = np.random.randn(3, 3)
+        q, r = np.linalg.qr(random_matrix)
+        # Ensure proper rotation (det = 1)
+        d = np.diag(np.sign(np.diag(r)))
+        rotation = q @ d
+        if np.linalg.det(rotation) < 0:
+            rotation[:, 0] *= -1
+        return rotation.astype(np.float32)
+
+
+# =============================================================================
+# Ligand Atom Renaming Transform
+# =============================================================================
+
+
+class LigandAtomRenameTransform(BaseTransform):
+    """Rename ligand atoms to prevent information leakage.
+
+    From AF3: Ligand atom names are renamed to element + count
+    (e.g., C1, C2, N1) to avoid leaking structural information
+    through atom naming conventions.
+
+    Input keys:
+        - atoms: List[Dict[str, AtomData]] per token
+        - token_types: List[str]
+
+    Output keys:
+        - atoms: Updated with renamed atom names for ligands
+        - original_atom_names: List[List[str]] original names for reference
+    """
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atoms_per_token = data.get("atoms", [])
+        token_types = data.get("token_types", [])
+
+        original_names = []
+        renamed_atoms = []
+
+        for atoms, ttype in zip(atoms_per_token, token_types):
+            if not isinstance(atoms, dict):
+                renamed_atoms.append(atoms)
+                original_names.append([])
+                continue
+
+            if ttype not in ("ligand", "other"):
+                renamed_atoms.append(atoms)
+                original_names.append(list(atoms.keys()))
+                continue
+
+            # Rename ligand atoms
+            element_counts = {}
+            new_atoms = {}
+            token_original_names = []
+
+            for atom_name, atom_data in atoms.items():
+                token_original_names.append(atom_name)
+
+                # Get element
+                element = atom_data.element if hasattr(atom_data, "element") else atom_data.get("element", "X")
+                element = element.upper()
+
+                # Generate new name
+                element_counts[element] = element_counts.get(element, 0) + 1
+                new_name = f"{element}{element_counts[element]}"
+
+                new_atoms[new_name] = atom_data
+
+            renamed_atoms.append(new_atoms)
+            original_names.append(token_original_names)
+
+        data["atoms"] = renamed_atoms
+        data["original_atom_names"] = original_names
+        return data
+
+
+# =============================================================================
+# Token Bond Transforms
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class BondConfig:
+    """Configuration for token bond feature extraction.
+
+    From AF3 Table 5: token_bonds restricted to polymer-ligand
+    and ligand-ligand bonds.
+
+    Attributes:
+        include_polymer_ligand: Include polymer-ligand bonds.
+        include_ligand_ligand: Include ligand-ligand bonds.
+        include_disulfide: Include disulfide bonds.
+        exclude_standard_polymer: Exclude standard polymer-polymer bonds.
+        bond_distance_threshold: Maximum distance for bond detection.
+    """
+
+    include_polymer_ligand: bool = True
+    include_ligand_ligand: bool = True
+    include_disulfide: bool = True
+    exclude_standard_polymer: bool = True
+    bond_distance_threshold: float = 2.4
+
+
+class TokenBondTransform(BaseTransform):
+    """Extract token-level bond features.
+
+    From AF3 Table 5: token_bonds is a 2D matrix indicating bonds
+    between tokens, restricted to polymer-ligand and ligand-ligand bonds.
+
+    Input keys:
+        - bonds: List of (atom_i, atom_j, bond_type) tuples
+        - atom_to_token: np.ndarray (Natoms,)
+        - token_types: List[str]
+        - num_tokens: int
+
+    Output keys:
+        - token_bonds: np.ndarray (Ntokens, Ntokens) adjacency matrix
+    """
+
+    def __init__(
+        self,
+        config: Optional[FeatureConfig] = None,
+        bond_config: Optional[BondConfig] = None,
+    ):
+        super().__init__(config)
+        self.bond_config = bond_config or BondConfig()
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        bonds = data.get("bonds", [])
+        atom_to_token = data.get("atom_to_token", np.array([]))
+        token_types = data.get("token_types", [])
+        num_tokens = data.get("num_tokens", len(token_types))
+
+        token_bonds = np.zeros((num_tokens, num_tokens), dtype=np.int32)
+
+        if len(bonds) == 0 or len(atom_to_token) == 0:
+            data["token_bonds"] = token_bonds
+            return data
+
+        # Classify tokens by type
+        polymer_tokens = set()
+        ligand_tokens = set()
+
+        for i, ttype in enumerate(token_types):
+            if ttype in ("protein", "rna", "dna"):
+                polymer_tokens.add(i)
+            else:
+                ligand_tokens.add(i)
+
+        # Process bonds
+        for bond in bonds:
+            if len(bond) >= 2:
+                atom_i, atom_j = bond[0], bond[1]
+
+                if atom_i >= len(atom_to_token) or atom_j >= len(atom_to_token):
+                    continue
+
+                token_i = atom_to_token[atom_i]
+                token_j = atom_to_token[atom_j]
+
+                if token_i == token_j:
+                    continue  # Skip intra-token bonds
+
+                # Determine bond type
+                is_polymer_i = token_i in polymer_tokens
+                is_polymer_j = token_j in polymer_tokens
+                is_ligand_i = token_i in ligand_tokens
+                is_ligand_j = token_j in ligand_tokens
+
+                include_bond = False
+
+                # Polymer-ligand bonds
+                if self.bond_config.include_polymer_ligand:
+                    if (is_polymer_i and is_ligand_j) or (is_ligand_i and is_polymer_j):
+                        include_bond = True
+
+                # Ligand-ligand bonds
+                if self.bond_config.include_ligand_ligand:
+                    if is_ligand_i and is_ligand_j:
+                        include_bond = True
+
+                # Exclude standard polymer-polymer bonds
+                if self.bond_config.exclude_standard_polymer:
+                    if is_polymer_i and is_polymer_j:
+                        include_bond = False
+
+                if include_bond:
+                    token_bonds[token_i, token_j] = 1
+                    token_bonds[token_j, token_i] = 1
+
+        data["token_bonds"] = token_bonds
+        return data
+
+
+# =============================================================================
+# Mask Feature Transforms
+# =============================================================================
+
+
+class RepresentativeAtomMaskTransform(BaseTransform):
+    """Compute representative atom masks for various metrics.
+
+    From AF3: Different metrics use different representative atoms:
+    - PAE: Center atoms (CA for protein, C1' for nucleic, center for ligand)
+    - pLDDT: All heavy atoms
+    - Distogram: CB atoms (CA for glycine)
+
+    Input keys:
+        - atoms: List[Dict[str, AtomData]] per token
+        - token_types: List[str]
+        - residue_names: List[str]
+        - atom_to_token: np.ndarray (Natoms,)
+
+    Output keys:
+        - pae_rep_atom_mask: np.ndarray (Natoms,) center atoms
+        - plddt_rep_atom_mask: np.ndarray (Natoms,) all heavy atoms
+        - distogram_rep_atom_mask: np.ndarray (Natoms,) CB/CA atoms
+    """
+
+    # Center atoms by molecule type
+    PROTEIN_CENTER = "CA"
+    NUCLEIC_CENTER = "C1'"
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atoms_per_token = data.get("atoms", [])
+        token_types = data.get("token_types", [])
+        residue_names = data.get("residue_names", [])
+        atom_to_token = data.get("atom_to_token", np.array([]))
+
+        num_atoms = len(atom_to_token)
+
+        pae_rep_mask = np.zeros(num_atoms, dtype=np.int32)
+        plddt_rep_mask = np.ones(num_atoms, dtype=np.int32)  # All atoms by default
+        distogram_rep_mask = np.zeros(num_atoms, dtype=np.int32)
+
+        # Build atom index mapping
+        global_idx = 0
+        for token_idx, (atoms, ttype, res_name) in enumerate(
+            zip(atoms_per_token, token_types, residue_names)
+        ):
+            if not isinstance(atoms, dict):
+                continue
+
+            atom_names = list(atoms.keys())
+
+            for atom_name in atom_names:
+                # PAE representative (center atoms)
+                if ttype == "protein" and atom_name == self.PROTEIN_CENTER:
+                    pae_rep_mask[global_idx] = 1
+                elif ttype in ("rna", "dna") and atom_name == self.NUCLEIC_CENTER:
+                    pae_rep_mask[global_idx] = 1
+                elif ttype in ("ligand", "other"):
+                    # First atom is center for ligands
+                    if atom_name == atom_names[0]:
+                        pae_rep_mask[global_idx] = 1
+
+                # Distogram representative (CB or CA for GLY)
+                if ttype == "protein":
+                    if res_name == "GLY" and atom_name == "CA":
+                        distogram_rep_mask[global_idx] = 1
+                    elif atom_name == "CB":
+                        distogram_rep_mask[global_idx] = 1
+
+                global_idx += 1
+
+        data["pae_rep_atom_mask"] = pae_rep_mask
+        data["plddt_rep_atom_mask"] = plddt_rep_mask
+        data["distogram_rep_atom_mask"] = distogram_rep_mask
+        return data
+
+
+class ModifiedResidueMaskTransform(BaseTransform):
+    """Identify modified residues.
+
+    Modified residues are non-standard residues in polymer chains
+    (e.g., phosphorylated amino acids, methylated bases).
+
+    Input keys:
+        - residue_names: List[str]
+        - token_types: List[str]
+
+    Output keys:
+        - modified_res_mask: np.ndarray (Ntokens,) int32
+    """
+
+    # Standard residue names
+    STANDARD_AA = {
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY",
+        "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER",
+        "THR", "TRP", "TYR", "VAL",
+    }
+    STANDARD_RNA = {"A", "G", "C", "U"}
+    STANDARD_DNA = {"DA", "DG", "DC", "DT"}
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        residue_names = data.get("residue_names", [])
+        token_types = data.get("token_types", [])
+
+        n_tokens = len(residue_names)
+        modified_mask = np.zeros(n_tokens, dtype=np.int32)
+
+        for i, (name, ttype) in enumerate(zip(residue_names, token_types)):
+            is_modified = False
+
+            if ttype == "protein" and name not in self.STANDARD_AA:
+                is_modified = True
+            elif ttype == "rna" and name not in self.STANDARD_RNA:
+                is_modified = True
+            elif ttype == "dna" and name not in self.STANDARD_DNA:
+                is_modified = True
+
+            if is_modified:
+                modified_mask[i] = 1
+
+        data["modified_res_mask"] = modified_mask
+        return data
+
+
+# =============================================================================
+# Atom Permutation Transform
+# =============================================================================
+
+
+class AtomPermutationTransform(BaseTransform):
+    """Compute valid atom permutations for symmetric residues.
+
+    From AF3: Some residues have symmetric atoms that can be permuted
+    without changing the structure (e.g., ARG NH1/NH2, PHE ring carbons).
+
+    This transform computes the valid permutation indices for each residue.
+
+    Input keys:
+        - atoms: List[Dict[str, AtomData]] per token
+        - residue_names: List[str]
+
+    Output keys:
+        - atom_permutations: List[np.ndarray] permutation matrices per residue
+    """
+
+    # Symmetric atom groups for amino acids
+    SYMMETRIC_ATOMS = {
+        "ARG": [["NH1", "NH2"]],
+        "ASP": [["OD1", "OD2"]],
+        "GLU": [["OE1", "OE2"]],
+        "LEU": [["CD1", "CD2"]],
+        "PHE": [["CD1", "CD2"], ["CE1", "CE2"]],
+        "TYR": [["CD1", "CD2"], ["CE1", "CE2"]],
+        "VAL": [["CG1", "CG2"]],
+    }
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atoms_per_token = data.get("atoms", [])
+        residue_names = data.get("residue_names", [])
+
+        atom_permutations = []
+
+        for atoms, res_name in zip(atoms_per_token, residue_names):
+            if not isinstance(atoms, dict):
+                atom_permutations.append(np.array([]))
+                continue
+
+            atom_names = list(atoms.keys())
+            n_atoms = len(atom_names)
+
+            # Identity permutation
+            identity = np.arange(n_atoms, dtype=np.int32)
+            permutations = [identity]
+
+            # Check for symmetric atoms
+            if res_name in self.SYMMETRIC_ATOMS:
+                for sym_group in self.SYMMETRIC_ATOMS[res_name]:
+                    # Check if both atoms exist
+                    if all(atom in atom_names for atom in sym_group):
+                        # Create swapped permutation
+                        swapped = identity.copy()
+                        idx1 = atom_names.index(sym_group[0])
+                        idx2 = atom_names.index(sym_group[1])
+                        swapped[idx1], swapped[idx2] = swapped[idx2], swapped[idx1]
+                        permutations.append(swapped)
+
+            atom_permutations.append(np.array(permutations, dtype=np.int32))
+
+        data["atom_permutations"] = atom_permutations
+        return data
+
+
+# =============================================================================
+# Ligand Pocket Mask Transform
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class PocketConfig:
+    """Configuration for ligand pocket detection.
+
+    Attributes:
+        pocket_radius: Radius (Angstroms) for pocket definition.
+        protein_backbone_only: Only include backbone atoms for protein pocket.
+    """
+
+    pocket_radius: float = 10.0
+    protein_backbone_only: bool = True
+
+
+class LigandPocketMaskTransform(BaseTransform):
+    """Compute ligand binding pocket masks.
+
+    From AF3 Methods: The pocket is defined as all heavy atoms within
+    10 Angstroms of any heavy atom of the ligand, restricted to
+    backbone atoms for proteins.
+
+    Input keys:
+        - atom_ref_pos: np.ndarray (Natoms, 3)
+        - atom_to_token: np.ndarray (Natoms,)
+        - token_types: List[str]
+        - atoms: List[Dict[str, AtomData]] per token
+
+    Output keys:
+        - ligand_mask: np.ndarray (Natoms,) atoms belonging to ligands
+        - pocket_mask: np.ndarray (Natoms,) atoms in binding pocket
+    """
+
+    PROTEIN_BACKBONE = {"N", "CA", "C", "O"}
+
+    def __init__(
+        self,
+        config: Optional[FeatureConfig] = None,
+        pocket_config: Optional[PocketConfig] = None,
+    ):
+        super().__init__(config)
+        self.pocket_config = pocket_config or PocketConfig()
+
+    def __call__(self, data: FeatureDict) -> FeatureDict:
+        atom_ref_pos = data.get("atom_ref_pos", np.zeros((0, 3)))
+        atom_to_token = data.get("atom_to_token", np.array([]))
+        token_types = data.get("token_types", [])
+        atoms_per_token = data.get("atoms", [])
+
+        num_atoms = len(atom_to_token)
+
+        ligand_mask = np.zeros(num_atoms, dtype=np.int32)
+        pocket_mask = np.zeros(num_atoms, dtype=np.int32)
+
+        if num_atoms == 0:
+            data["ligand_mask"] = ligand_mask
+            data["pocket_mask"] = pocket_mask
+            return data
+
+        # Build ligand atom mask
+        ligand_token_indices = set()
+        for i, ttype in enumerate(token_types):
+            if ttype in ("ligand", "other"):
+                ligand_token_indices.add(i)
+
+        for atom_idx in range(num_atoms):
+            token_idx = atom_to_token[atom_idx]
+            if token_idx in ligand_token_indices:
+                ligand_mask[atom_idx] = 1
+
+        # Find ligand positions
+        ligand_positions = atom_ref_pos[ligand_mask > 0]
+
+        if len(ligand_positions) == 0:
+            data["ligand_mask"] = ligand_mask
+            data["pocket_mask"] = pocket_mask
+            return data
+
+        # Build protein backbone mask
+        backbone_mask = np.zeros(num_atoms, dtype=bool)
+        global_idx = 0
+
+        for token_idx, (atoms, ttype) in enumerate(zip(atoms_per_token, token_types)):
+            if not isinstance(atoms, dict):
+                continue
+
+            for atom_name in atoms.keys():
+                if ttype == "protein":
+                    if self.pocket_config.protein_backbone_only:
+                        if atom_name in self.PROTEIN_BACKBONE:
+                            backbone_mask[global_idx] = True
+                    else:
+                        backbone_mask[global_idx] = True
+                global_idx += 1
+
+        # Use KDTree to find atoms within pocket radius
+        try:
+            from scipy.spatial import cKDTree
+
+            kdtree = cKDTree(atom_ref_pos)
+            pocket_indices = set()
+
+            for lig_pos in ligand_positions:
+                indices = kdtree.query_ball_point(
+                    lig_pos, self.pocket_config.pocket_radius
+                )
+                pocket_indices.update(indices)
+
+            for idx in pocket_indices:
+                if backbone_mask[idx]:
+                    pocket_mask[idx] = 1
+
+        except ImportError:
+            # Fallback: brute force distance calculation
+            for atom_idx in range(num_atoms):
+                if not backbone_mask[atom_idx]:
+                    continue
+
+                atom_pos = atom_ref_pos[atom_idx]
+                distances = np.linalg.norm(ligand_positions - atom_pos, axis=1)
+
+                if np.min(distances) <= self.pocket_config.pocket_radius:
+                    pocket_mask[atom_idx] = 1
+
+        data["ligand_mask"] = ligand_mask
+        data["pocket_mask"] = pocket_mask
+        return data
+
+
+# =============================================================================
 # Per-Chain Transforms
 # =============================================================================
 

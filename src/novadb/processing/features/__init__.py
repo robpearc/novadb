@@ -56,6 +56,10 @@ from novadb.processing.features.transforms import (
     DistogramConfig,
     MSAConfig,
     TemplateConfig,
+    FrameConfig,
+    AugmentConfig,
+    BondConfig,
+    PocketConfig,
     # Per-token transforms
     ResidueTypeEncodeTransform,
     TokenTypeEncodeTransform,
@@ -65,6 +69,21 @@ from novadb.processing.features.transforms import (
     ResidueAtomFeatureTransform,
     PseudoBetaTransform,
     BackboneCompleteTransform,
+    # Frame construction transforms
+    TokenFrameTransform,
+    FrameFromPositionsTransform,
+    # Reference conformer transforms
+    RefPosAugmentTransform,
+    LigandAtomRenameTransform,
+    # Bond transforms
+    TokenBondTransform,
+    # Mask transforms
+    RepresentativeAtomMaskTransform,
+    ModifiedResidueMaskTransform,
+    # Atom permutation
+    AtomPermutationTransform,
+    # Pocket transforms
+    LigandPocketMaskTransform,
     # Per-chain transforms
     ChainTokenFeatureTransform,
     ChainAtomFeatureTransform,
@@ -127,6 +146,10 @@ __all__ = [
     "DistogramConfig",
     "MSAConfig",
     "TemplateConfig",
+    "FrameConfig",
+    "AugmentConfig",
+    "BondConfig",
+    "PocketConfig",
     # Per-token transforms
     "ResidueTypeEncodeTransform",
     "TokenTypeEncodeTransform",
@@ -136,6 +159,21 @@ __all__ = [
     "ResidueAtomFeatureTransform",
     "PseudoBetaTransform",
     "BackboneCompleteTransform",
+    # Frame construction transforms
+    "TokenFrameTransform",
+    "FrameFromPositionsTransform",
+    # Reference conformer transforms
+    "RefPosAugmentTransform",
+    "LigandAtomRenameTransform",
+    # Bond transforms
+    "TokenBondTransform",
+    # Mask transforms
+    "RepresentativeAtomMaskTransform",
+    "ModifiedResidueMaskTransform",
+    # Atom permutation
+    "AtomPermutationTransform",
+    # Pocket transforms
+    "LigandPocketMaskTransform",
     # Per-chain transforms
     "ChainTokenFeatureTransform",
     "ChainAtomFeatureTransform",
