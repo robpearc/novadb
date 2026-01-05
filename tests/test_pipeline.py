@@ -335,7 +335,7 @@ class TestCropping:
     def test_contiguous_crop(self, sample_structure):
         """Test contiguous cropping."""
         from novadb.processing.tokenization.tokenizer import Tokenizer
-        from novadb.processing.cropping.cropping import Cropper, CropConfig
+        from novadb.processing.cropping import Cropper, CropConfig
         
         tokenizer = Tokenizer()
         tokenized = tokenizer.tokenize(sample_structure)
@@ -350,7 +350,7 @@ class TestCropping:
     def test_spatial_crop(self, sample_structure):
         """Test spatial cropping."""
         from novadb.processing.tokenization.tokenizer import Tokenizer
-        from novadb.processing.cropping.cropping import Cropper, CropConfig
+        from novadb.processing.cropping import Cropper, CropConfig
         
         tokenizer = Tokenizer()
         tokenized = tokenizer.tokenize(sample_structure)
@@ -365,7 +365,7 @@ class TestCropping:
     def test_crop_preserves_connectivity(self, sample_structure):
         """Test that cropping preserves chain connectivity info."""
         from novadb.processing.tokenization.tokenizer import Tokenizer
-        from novadb.processing.cropping.cropping import Cropper, CropConfig
+        from novadb.processing.cropping import Cropper, CropConfig
         
         tokenizer = Tokenizer()
         tokenized = tokenizer.tokenize(sample_structure)

@@ -89,14 +89,15 @@ from novadb.processing.features import (
 
 # Cropping
 from novadb.processing.cropping import (
-    CroppingStrategy,
-    CropConfig,
-    CropResult,
-    Cropper,
     # Configuration
     CropTransformConfig,
+    CropConfig,
     # Data structures
     MoleculeInfo,
+    CropResult,
+    LegacyCropResult,
+    # Enum
+    CroppingStrategy,
     # Base class
     BaseCropTransform,
     # Preprocessing transforms
@@ -108,13 +109,19 @@ from novadb.processing.cropping import (
     SpatialCropTransform,
     CombinedCropTransform,
     ApplyCropTransform,
-    # Legacy compatibility
+    # Legacy compatibility transforms
     CropTransform,
     CropToTokenLimitTransform,
+    # Backward-compatible cropper classes
+    Cropper,
+    ContiguousCropper,
+    SpatialCropper,
+    SpatialInterfaceCropper,
     # Utility functions
     compute_distances_fast,
     identify_molecule_types,
     get_interface_tokens,
+    check_atom_limit,
     # Pipeline factory
     create_crop_pipeline,
     apply_crop_pipeline,
@@ -257,12 +264,12 @@ __all__ = [
     "DistogramTransform",
     "extract_features_fast",
     # Cropping
-    "CroppingStrategy",
-    "CropConfig",
-    "CropResult",
-    "Cropper",
     "CropTransformConfig",
+    "CropConfig",
     "MoleculeInfo",
+    "CropResult",
+    "LegacyCropResult",
+    "CroppingStrategy",
     "BaseCropTransform",
     "MoleculeInfoTransform",
     "TokenDistanceMatrixTransform",
@@ -273,9 +280,14 @@ __all__ = [
     "ApplyCropTransform",
     "CropTransform",
     "CropToTokenLimitTransform",
+    "Cropper",
+    "ContiguousCropper",
+    "SpatialCropper",
+    "SpatialInterfaceCropper",
     "compute_distances_fast",
     "identify_molecule_types",
     "get_interface_tokens",
+    "check_atom_limit",
     "create_crop_pipeline",
     "apply_crop_pipeline",
     # Curation

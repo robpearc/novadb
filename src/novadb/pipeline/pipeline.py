@@ -25,7 +25,7 @@ from novadb.data.parsers.mmcif_parser import MMCIFParser
 from novadb.data.parsers.structure import Structure
 from novadb.processing.tokenization.tokenizer import Tokenizer, TokenizedStructure
 from novadb.processing.features.features import FeatureExtractor, InputFeatures
-from novadb.processing.cropping.cropping import Cropper, CropConfig
+from novadb.processing.cropping import Cropper, CropConfig
 from novadb.processing.curation.filtering import StructureFilter, FilterResult
 from novadb.processing.curation.sampling import DatasetEntry, DatasetSampler
 from novadb.search.msa.msa import MSA

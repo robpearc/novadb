@@ -9,23 +9,16 @@ Cropping Methods (Table 4):
 - SpatialInterfaceCropping: Select tokens nearest to interface tokens
 """
 
-from novadb.processing.cropping.cropping import (
-    CroppingStrategy,
-    CropConfig,
-    CropResult as CropperResult,
-    Cropper,
-    ContiguousCropper,
-    SpatialCropper,
-    SpatialInterfaceCropper,
-    check_atom_limit,
-)
-
 from novadb.processing.cropping.transforms import (
     # Configuration
     CropTransformConfig,
+    CropConfig,  # Backward compatibility
     # Data structures
     MoleculeInfo,
     CropResult,
+    LegacyCropResult,  # Backward compatibility
+    # Enum
+    CroppingStrategy,
     # Base class
     BaseCropTransform,
     # Preprocessing transforms
@@ -37,33 +30,34 @@ from novadb.processing.cropping.transforms import (
     SpatialCropTransform,
     CombinedCropTransform,
     ApplyCropTransform,
-    # Legacy compatibility
+    # Legacy compatibility transforms
     CropTransform,
     CropToTokenLimitTransform,
+    # Backward-compatible cropper classes
+    Cropper,
+    ContiguousCropper,
+    SpatialCropper,
+    SpatialInterfaceCropper,
     # Utility functions
     compute_distances_fast,
     identify_molecule_types,
     get_interface_tokens,
+    check_atom_limit,
     # Pipeline factory
     create_crop_pipeline,
     apply_crop_pipeline,
 )
 
 __all__ = [
-    # Legacy cropper classes
-    "CroppingStrategy",
-    "CropConfig",
-    "CropperResult",
-    "Cropper",
-    "ContiguousCropper",
-    "SpatialCropper",
-    "SpatialInterfaceCropper",
-    "check_atom_limit",
     # Configuration
     "CropTransformConfig",
+    "CropConfig",
     # Data structures
     "MoleculeInfo",
     "CropResult",
+    "LegacyCropResult",
+    # Enum
+    "CroppingStrategy",
     # Base class
     "BaseCropTransform",
     # Preprocessing transforms
@@ -75,13 +69,19 @@ __all__ = [
     "SpatialCropTransform",
     "CombinedCropTransform",
     "ApplyCropTransform",
-    # Legacy compatibility
+    # Legacy compatibility transforms
     "CropTransform",
     "CropToTokenLimitTransform",
+    # Backward-compatible cropper classes
+    "Cropper",
+    "ContiguousCropper",
+    "SpatialCropper",
+    "SpatialInterfaceCropper",
     # Utility functions
     "compute_distances_fast",
     "identify_molecule_types",
     "get_interface_tokens",
+    "check_atom_limit",
     # Pipeline factory
     "create_crop_pipeline",
     "apply_crop_pipeline",

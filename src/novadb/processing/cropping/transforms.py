@@ -963,3 +963,316 @@ class CropToTokenLimitTransform(BaseCropTransform):
         # Apply crop
         apply_transform = ApplyCropTransform(self.config)
         return apply_transform(data)
+
+
+# =============================================================================
+# Backward Compatibility with cropping.py API
+# =============================================================================
+
+from enum import Enum, auto
+
+
+class CroppingStrategy(Enum):
+    """Cropping strategy selection (backward compatibility)."""
+    CONTIGUOUS = auto()
+    SPATIAL = auto()
+    SPATIAL_INTERFACE = auto()
+
+
+@dataclass
+class CropConfig:
+    """Configuration for cropping (backward compatibility).
+
+    From AF3 Table 4 and Section 2.7.
+    """
+    max_tokens: int = 384
+    max_atoms: int = 4608
+    contiguous_weight: float = 0.2
+    spatial_weight: float = 0.4
+    spatial_interface_weight: float = 0.4
+    contiguous_crop_size: int = 128
+    spatial_radius: float = 24.0
+    interface_distance: float = 15.0
+
+    def to_transform_config(self) -> CropTransformConfig:
+        """Convert to CropTransformConfig."""
+        return CropTransformConfig(
+            max_tokens=self.max_tokens,
+            max_atoms=self.max_atoms,
+            interface_distance=self.interface_distance,
+            method_weights=(
+                self.contiguous_weight,
+                self.spatial_weight,
+                self.spatial_interface_weight,
+            ),
+        )
+
+
+class Cropper:
+    """Main cropper with backward-compatible API.
+
+    Wraps the new transform-based implementation while providing
+    the same interface as the original Cropper class.
+    """
+
+    def __init__(self, config: Optional[CropConfig] = None):
+        self.config = config or CropConfig()
+        self._transform_config = self.config.to_transform_config()
+
+    def crop(
+        self,
+        tokenized: Any,  # TokenizedStructure
+        rng: Optional[np.random.Generator] = None,
+        strategy: Optional[CroppingStrategy] = None,
+    ) -> "LegacyCropResult":
+        """Crop a tokenized structure.
+
+        Args:
+            tokenized: Structure to crop
+            rng: Random number generator
+            strategy: Specific strategy to use, or None to sample
+
+        Returns:
+            LegacyCropResult with selected token indices
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        # Set seed for reproducibility
+        np.random.seed(rng.integers(0, 2**31))
+
+        tokens = tokenized.tokens
+        n_tokens = len(tokens)
+
+        if n_tokens <= self.config.max_tokens:
+            return LegacyCropResult(
+                token_indices=np.arange(n_tokens, dtype=np.int32),
+                strategy=strategy or CroppingStrategy.CONTIGUOUS,
+            )
+
+        # Build feature dict from tokenized structure
+        data = self._tokenized_to_feature_dict(tokenized)
+
+        # Select strategy
+        if strategy is None:
+            strategy = self._sample_strategy(rng)
+
+        # Configure transform based on strategy
+        if strategy == CroppingStrategy.CONTIGUOUS:
+            method_weights = (1.0, 0.0, 0.0)
+        elif strategy == CroppingStrategy.SPATIAL:
+            method_weights = (0.0, 1.0, 0.0)
+        else:
+            method_weights = (0.0, 0.0, 1.0)
+
+        config = CropTransformConfig(
+            max_tokens=self.config.max_tokens,
+            max_atoms=self.config.max_atoms,
+            interface_distance=self.config.interface_distance,
+            method_weights=method_weights,
+        )
+
+        # Run transform pipeline
+        combined = CombinedCropTransform(config)
+        data = combined(data)
+
+        crop_result = data.get("crop_result")
+        if crop_result is None:
+            return LegacyCropResult(
+                token_indices=np.arange(min(n_tokens, self.config.max_tokens), dtype=np.int32),
+                strategy=strategy,
+            )
+
+        return LegacyCropResult(
+            token_indices=crop_result.selected_indices.astype(np.int32),
+            strategy=strategy,
+            center_token_idx=crop_result.reference_token_idx if crop_result.reference_token_idx >= 0 else None,
+        )
+
+    def _tokenized_to_feature_dict(self, tokenized: Any) -> FeatureDict:
+        """Convert TokenizedStructure to feature dictionary."""
+        tokens = tokenized.tokens
+        n_tokens = len(tokens)
+
+        # Extract chain IDs
+        chain_ids = np.zeros(n_tokens, dtype=np.int64)
+        chain_id_map = {}
+        for i, token in enumerate(tokens):
+            if token.chain_id not in chain_id_map:
+                chain_id_map[token.chain_id] = len(chain_id_map)
+            chain_ids[i] = chain_id_map[token.chain_id]
+
+        # Extract coordinates
+        coords = np.zeros((n_tokens, 3), dtype=np.float32)
+        for i, token in enumerate(tokens):
+            if token.center_coords is not None:
+                coords[i] = token.center_coords
+
+        # Extract ref_space_uid (use residue indices)
+        ref_space_uid = np.zeros(n_tokens, dtype=np.int64)
+        for i, token in enumerate(tokens):
+            ref_space_uid[i] = getattr(token, 'residue_index', i)
+
+        return {
+            "num_tokens": n_tokens,
+            "asym_id": chain_ids,
+            "centre_atom_coords": coords,
+            "ref_space_uid": ref_space_uid,
+            "is_resolved": np.ones(n_tokens, dtype=bool),
+        }
+
+    def _sample_strategy(self, rng: np.random.Generator) -> CroppingStrategy:
+        """Sample a cropping strategy based on configured weights."""
+        weights = np.array([
+            self.config.contiguous_weight,
+            self.config.spatial_weight,
+            self.config.spatial_interface_weight,
+        ])
+        weights = weights / weights.sum()
+
+        strategies = [
+            CroppingStrategy.CONTIGUOUS,
+            CroppingStrategy.SPATIAL,
+            CroppingStrategy.SPATIAL_INTERFACE,
+        ]
+
+        idx = rng.choice(len(strategies), p=weights)
+        return strategies[idx]
+
+    def contiguous_crop(
+        self,
+        tokenized: Any,
+        max_tokens: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Any:
+        """Apply contiguous cropping strategy."""
+        result = self.crop(tokenized, rng, strategy=CroppingStrategy.CONTIGUOUS)
+        return self._apply_crop_result(tokenized, result)
+
+    def spatial_crop(
+        self,
+        tokenized: Any,
+        max_tokens: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Any:
+        """Apply spatial cropping strategy."""
+        result = self.crop(tokenized, rng, strategy=CroppingStrategy.SPATIAL)
+        return self._apply_crop_result(tokenized, result)
+
+    def crop_to_token_limit(
+        self,
+        tokenized: Any,
+        max_tokens: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Any:
+        """Crop and return new tokenized structure."""
+        if len(tokenized.tokens) <= max_tokens:
+            return tokenized
+
+        # Create temporary config
+        temp_config = CropConfig(
+            max_tokens=max_tokens,
+            contiguous_weight=self.config.contiguous_weight,
+            spatial_weight=self.config.spatial_weight,
+            spatial_interface_weight=self.config.spatial_interface_weight,
+        )
+        temp_cropper = Cropper(temp_config)
+        result = temp_cropper.crop(tokenized, rng)
+
+        return self._apply_crop_result(tokenized, result)
+
+    def _apply_crop_result(
+        self,
+        tokenized: Any,
+        result: "LegacyCropResult",
+    ) -> Any:
+        """Apply a crop result to create new TokenizedStructure."""
+        from novadb.processing.tokenization.tokenizer import TokenizedStructure
+
+        selected = set(result.token_indices)
+        new_tokens = []
+        for i, token in enumerate(tokenized.tokens):
+            if i in selected:
+                new_tokens.append(token)
+
+        # Renumber token indices
+        for i, token in enumerate(new_tokens):
+            token.token_index = i
+
+        return TokenizedStructure(
+            tokens=new_tokens,
+            pdb_id=tokenized.pdb_id,
+            chain_id_to_index=tokenized.chain_id_to_index,
+            entity_id_map=tokenized.entity_id_map,
+        )
+
+
+@dataclass
+class LegacyCropResult:
+    """Result of cropping operation (backward compatibility)."""
+    token_indices: np.ndarray
+    strategy: CroppingStrategy
+    center_token_idx: Optional[int] = None
+    interface_chains: Optional[Tuple[str, str]] = None
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.token_indices)
+
+
+# Backward-compatible croppers
+class ContiguousCropper:
+    """Contiguous cropping strategy (backward compatibility)."""
+
+    def __init__(self, config: CropConfig):
+        self.config = config
+
+    def crop(self, tokenized: Any, rng: np.random.Generator) -> LegacyCropResult:
+        cropper = Cropper(self.config)
+        return cropper.crop(tokenized, rng, strategy=CroppingStrategy.CONTIGUOUS)
+
+
+class SpatialCropper:
+    """Spatial cropping strategy (backward compatibility)."""
+
+    def __init__(self, config: CropConfig):
+        self.config = config
+
+    def crop(self, tokenized: Any, rng: np.random.Generator) -> LegacyCropResult:
+        cropper = Cropper(self.config)
+        return cropper.crop(tokenized, rng, strategy=CroppingStrategy.SPATIAL)
+
+
+class SpatialInterfaceCropper:
+    """Spatial interface cropping strategy (backward compatibility)."""
+
+    def __init__(self, config: CropConfig):
+        self.config = config
+
+    def crop(self, tokenized: Any, rng: np.random.Generator) -> LegacyCropResult:
+        cropper = Cropper(self.config)
+        return cropper.crop(tokenized, rng, strategy=CroppingStrategy.SPATIAL_INTERFACE)
+
+
+def check_atom_limit(
+    tokens: List[Any],
+    selected_indices: np.ndarray,
+    max_atoms: int,
+) -> np.ndarray:
+    """Ensure selected tokens don't exceed atom limit.
+
+    From AF3: Both token and atom limits must be respected.
+    """
+    total_atoms = 0
+    valid_indices = []
+
+    for idx in selected_indices:
+        token = tokens[idx]
+        num_atoms = getattr(token, 'num_atoms', 1)
+        if total_atoms + num_atoms <= max_atoms:
+            valid_indices.append(idx)
+            total_atoms += num_atoms
+        else:
+            break
+
+    return np.array(valid_indices, dtype=np.int32)
